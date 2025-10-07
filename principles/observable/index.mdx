@@ -1,0 +1,387 @@
+---
+title: "Observability (Logs, Traces, Metrics)"
+description: "Observability (Logs, Traces, Metrics) section of the Microservice Development Guide."
+---
+
+# Observability (Logs, Traces, Metrics)
+
+```
+
+Logs: Structured (JSON), include traceId/spanId, user/tenant, operation name, domain entity IDs.
+Traces: OpenTelemetry SDK; propagate context across HTTP, gRPC, and messaging.
+
+```
+
+Metrics: Export RED/USE metrics and business KPIs. Define SLIs/SLOs per service.
+Example: Controller → Application Core → Domain → External Resource
+
+```csharp
+.NET (C#)
+// Controller
+[HttpPost("/accounts/open")]
+public async Task<IActionResult> Open([FromBody] Contracts.OpenAccountRequest request)
+{
+    using var span = _tracer.StartActiveSpan("AccountsController.Open");
+    span.SetAttribute("customer.id", request.OwnerId);
+
+```
+
+```
+
+    _logger.ForContext("traceId", Activity.Current?.TraceId)
+           .Information("Received OpenAccount request for {OwnerId}", request.OwnerId);
+
+```
+
+```
+
+    var command = _mapper.Map<OpenAccountCommand>(request);
+    var result = await _service.OpenAccount(command);
+
+```
+
+```
+
+    if (!result.Success)
+    {
+        span.SetStatus(Status.Error.WithDescription(result.ErrorMessage));
+        return UnprocessableEntity(new { result.ErrorCode, result.ErrorMessage });
+    }
+
+```
+
+```
+
+    var response = _mapper.Map<Contracts.AccountResponse>(result.Model);
+    return CreatedAtAction(nameof(Open), new { id = response.Id }, response);
+}
+
+```
+
+```csharp
+// Application Service
+public class AccountService
+{
+    private readonly IAccountRepository _repo;
+    private readonly Meter _meter;
+    private readonly Tracer _tracer;
+
+```
+
+```
+
+    public AccountService(IAccountRepository repo, Meter meter, Tracer tracer)
+    {
+        _repo = repo;
+        _meter = meter;
+        _tracer = tracer;
+    }
+
+```
+
+```csharp
+    public async Task<CommandResult<Account>> OpenAccount(OpenAccountCommand command)
+    {
+        using var span = _tracer.StartActiveSpan("AccountService.OpenAccount");
+        if (string.IsNullOrWhiteSpace(command.OwnerId))
+            return CommandResult<Account>.Fail(Errors.InvalidOwner.Code, Errors.InvalidOwner.Message);
+
+```
+
+```
+
+        var account = new Account(command.OwnerId);
+        _repo.Add(account);
+
+```
+
+```
+
+        var counter = _meter.CreateCounter<int>("accounts.opened");
+        counter.Add(1, KeyValuePair.Create("accountType", (object)command.Type));
+
+```
+
+```
+
+        return CommandResult<Account>.Ok(account);
+    }
+}
+
+```
+
+```csharp
+// Domain Aggregate
+public class Account
+{
+    public Account(string ownerId)
+    {
+        using var span = Tracer.CurrentSpan; // attach to current span
+        span?.AddEvent("Account aggregate created");
+        OwnerId = ownerId;
+    }
+    public string OwnerId { get; }
+}
+
+```
+
+```csharp
+// Infrastructure external resource call
+public class CreditCheckGateway
+{
+    private readonly HttpClient _client;
+    private readonly Tracer _tracer;
+    public CreditCheckGateway(HttpClient client, Tracer tracer)
+    {
+        _client = client;
+        _tracer = tracer;
+    }
+
+```
+
+```csharp
+    public async Task<bool> PerformCreditCheck(string ownerId)
+    {
+        using var span = _tracer.StartActiveSpan("CreditCheckGateway.PerformCreditCheck");
+        var response = await _client.GetAsync($"/credit/{ownerId}");
+        span.SetAttribute("http.status_code", (int)response.StatusCode);
+        return response.IsSuccessStatusCode;
+    }
+}
+Java (Spring Boot)
+// Controller
+@PostMapping("/accounts/open")
+public ResponseEntity<?> open(@RequestBody Contracts.OpenAccountRequest request) {
+    Span span = tracer.spanBuilder("AccountsController.open").startSpan();
+    try (Scope scope = span.makeCurrent()) {
+        span.setAttribute("customer.id", request.getOwnerId());
+        logger.info("Received OpenAccount request", kv("customerId", request.getOwnerId()));
+
+```
+
+```
+
+        OpenAccountCommand command = mapper.toCommand(request);
+        CommandResult<Account> result = service.openAccount(command);
+
+```
+
+```java
+        if (!result.isSuccess()) {
+            span.setStatus(StatusCode.ERROR, result.getErrorMessage());
+            return ResponseEntity.unprocessableEntity().body(Map.of("errorCode", result.getErrorCode(), "errorMessage", result.getErrorMessage()));
+        }
+
+```
+
+```java
+        Contracts.AccountResponse response = mapper.toResponse(result.getModel());
+        return ResponseEntity.status(HttpStatus.CREATED).body(response);
+    } finally { span.end(); }
+}
+
+```
+
+```csharp
+// Application Service
+@Service
+public class AccountService {
+    private final AccountRepository repo;
+    private final MeterRegistry registry;
+    private final Tracer tracer;
+
+```
+
+```
+
+    public AccountService(AccountRepository repo, MeterRegistry registry, Tracer tracer) {
+        this.repo = repo;
+        this.registry = registry;
+        this.tracer = tracer;
+    }
+
+```
+
+```
+
+    public CommandResult<Account> openAccount(OpenAccountCommand command) {
+        Span span = tracer.spanBuilder("AccountService.openAccount").startSpan();
+        try (Scope scope = span.makeCurrent()) {
+            if (command.getOwnerId() == null || command.getOwnerId().isEmpty()) {
+                return CommandResult.fail(Errors.InvalidOwner.Code, Errors.InvalidOwner.Message);
+            }
+
+```
+
+```
+
+            Account account = new Account(command.getOwnerId());
+            repo.add(account);
+
+```
+
+```
+
+            Counter counter = registry.counter("accounts.opened", "accountType", command.getType());
+            counter.increment();
+
+```
+
+```
+
+            return CommandResult.ok(account);
+        } finally { span.end(); }
+    }
+}
+
+```
+
+```csharp
+// Domain Aggregate
+public class Account {
+    private final String ownerId;
+    public Account(String ownerId) {
+        this.ownerId = ownerId;
+        Span.current().addEvent("Account aggregate created");
+    }
+    public String getOwnerId() { return ownerId; }
+}
+
+```
+
+```csharp
+// Infrastructure external resource call
+public class CreditCheckGateway {
+    private final RestTemplate restTemplate;
+    private final Tracer tracer;
+
+```
+
+```java
+    public CreditCheckGateway(RestTemplate restTemplate, Tracer tracer) {
+        this.restTemplate = restTemplate;
+        this.tracer = tracer;
+    }
+
+```
+
+```java
+    public boolean performCreditCheck(String ownerId) {
+        Span span = tracer.spanBuilder("CreditCheckGateway.performCreditCheck").startSpan();
+        try (Scope scope = span.makeCurrent()) {
+            ResponseEntity<String> response = restTemplate.getForEntity("/credit/" + ownerId, String.class);
+            span.setAttribute("http.status_code", response.getStatusCodeValue());
+            return response.getStatusCode().is2xxSuccessful();
+        } finally { span.end(); }
+    }
+}
+Node.js (Express + TypeScript)
+// Controller
+router.post('/accounts/open', async (req: Request, res: Response) => {
+  const span = tracer.startSpan("AccountsController.open");
+  try {
+    span.setAttribute("customer.id", req.body.ownerId);
+    logger.info({ traceId: span.spanContext().traceId, customerId: req.body.ownerId }, "Received OpenAccount request");
+
+```
+
+```js
+    const command = plainToClass(OpenAccountCommand, req.body);
+    const result = await accountService.openAccount(command);
+
+```
+
+```
+
+    if (!result.success) {
+      span.setStatus({ code: SpanStatusCode.ERROR, message: result.errorMessage });
+      return res.status(422).json({ errorCode: result.errorCode, errorMessage: result.errorMessage });
+    }
+
+```
+
+```js
+    const response = plainToClass(AccountResponse, result.model);
+    return res.status(201).json(response);
+  } finally {
+    span.end();
+  }
+});
+
+```
+
+```ts
+// Application Service
+export class AccountService {
+  constructor(private repo: AccountRepository, private tracer: Tracer) {}
+
+```
+
+```js
+  async openAccount(command: OpenAccountCommand): Promise<CommandResult<Account>> {
+    const span = this.tracer.startSpan("AccountService.openAccount");
+    try {
+      if (!command.ownerId) {
+        return CommandResult.fail<Account>(Errors.InvalidOwner.Code, Errors.InvalidOwner.Message);
+      }
+      const account = new Account(command.ownerId);
+      this.repo.add(account);
+      accountsOpened.inc({ accountType: command.type });
+      return CommandResult.ok(account);
+    } finally { span.end(); }
+  }
+}
+
+```
+
+```ts
+// Domain Aggregate
+export class Account {
+  constructor(public ownerId: string) {
+    const span = trace.getSpan(context.active());
+    span?.addEvent("Account aggregate created");
+  }
+}
+
+```
+
+```ts
+// Infrastructure external resource call
+export class CreditCheckGateway {
+  constructor(private http: AxiosInstance, private tracer: Tracer) {}
+
+```
+
+```js
+  async performCreditCheck(ownerId: string): Promise<boolean> {
+    const span = this.tracer.startSpan("CreditCheckGateway.performCreditCheck");
+    try {
+      const response = await this.http.get(`/credit/${ownerId}`);
+      span.setAttribute("http.status_code", response.status);
+      return response.status >= 200 && response.status < 300;
+    } finally { span.end(); }
+  }
+```
+
+```
+
+
+# Additional Guidance on Instrumentation
+
+**Instrumentation should not only wrap controllers but flow through the entire call stack. Business metrics and structured logs should be placed close to the source of truth for the data. Some patterns:**
+
+```
+
+Application Services should increment counters and record gauges when business outcomes occur (e.g., accounts opened, orders shipped).
+
+```
+
+Domain Aggregates can add span events to document important domain events being raised.
+Infrastructure Adapters should include span attributes for I/O status codes, latency, and payload sizes.
+Validation Services should log structured validation errors with codes and field names but never include sensitive PII.
+Example Patterns
+Counter metrics: increment in app services when operations succeed.
+Histograms: record latencies of outbound calls in infrastructure adapters.
+Span events: add to aggregates for lifecycle events.
+Structured logs: write at INFO for business transactions, DEBUG for flow details, WARN/ERROR for issues.
+This ensures observability is consistent across layers and supports root cause analysis, capacity planning, and feature value assessment.

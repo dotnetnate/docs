@@ -1,0 +1,450 @@
+---
+title: "gRPC Input Port Flow"
+description: "Implementation pattern for gRPC input ports with protocol-specific guidance and code examples."
+---
+
+# gRPC Input Port Flow
+
+This document shows how to implement the universal input port flow pattern specifically for gRPC services, including appropriate status codes and protobuf conventions.
+
+## gRPC Specific Flow
+
+1. **Authenticate and authorize** the request using gRPC metadata (authorization headers, API keys, etc.). Return **UNAUTHENTICATED** for authentication failures or **PERMISSION_DENIED** for authorization failures.
+
+2. **Receive inbound gRPC request** with strongly-typed protobuf messages via service method parameters.
+
+3. **Validate request message** against protobuf schema and business rules. Return **INVALID_ARGUMENT** with validation error details for invalid input.
+
+4. **Map protobuf message** to Application Core command/query objects using dedicated mappers.
+
+5. **Invoke Application Core service** with mapped objects to execute business logic.
+
+6. **Handle system exceptions** with RpcException wrapping. Return **INTERNAL** status with sanitized error messages.
+
+7. **Process successful business operations**:
+   - Return **OK** status with response message
+   - Use structured protobuf responses for consistent data format
+
+8. **Process business logic failures**:
+   - **ALREADY_EXISTS**: Resource conflicts (duplicate email, existing resources)
+   - **FAILED_PRECONDITION**: Business rule violations
+   - **NOT_FOUND**: Resource doesn't exist
+
+## Implementation Example
+
+<CodeGroup>
+```java Java
+@GrpcService
+public class CustomerGrpcService extends CustomerServiceGrpc.CustomerServiceImplBase {
+    private final IAuthenticationService authService;
+    private final IValidationService validationService;
+    private final ICustomerService customerService;
+    private final ICustomerMapper mapper;
+    
+    public CustomerGrpcService(IAuthenticationService authService,
+                              IValidationService validationService,
+                              ICustomerService customerService,
+                              ICustomerMapper mapper) {
+        this.authService = authService;
+        this.validationService = validationService;
+        this.customerService = customerService;
+        this.mapper = mapper;
+    }
+    
+    @Override
+    public void createCustomer(CreateCustomerRequest request,
+                              StreamObserver<CreateCustomerResponse> responseObserver) {
+        try {
+            // 1. Authentication & Authorization
+            var metadata = getCallMetadata();
+            var authResult = authService.authenticate(metadata);
+            if (!authResult.isAuthenticated()) {
+                responseObserver.onError(Status.UNAUTHENTICATED
+                    .withDescription("Authentication failed")
+                    .asRuntimeException());
+                return;
+            }
+            
+            if (!authService.isAuthorized(authResult.getUser(), "customer:create")) {
+                responseObserver.onError(Status.PERMISSION_DENIED
+                    .withDescription("Insufficient permissions")
+                    .asRuntimeException());
+                return;
+            }
+            
+            // 3. Input Validation
+            var validationResult = validationService.validate(request);
+            if (!validationResult.isValid()) {
+                var errorBuilder = ErrorDetails.newBuilder();
+                validationResult.getErrors().forEach(error -> 
+                    errorBuilder.addViolations(
+                        FieldViolation.newBuilder()
+                            .setField(error.getField())
+                            .setDescription(error.getMessage())
+                            .build()));
+                
+                responseObserver.onError(Status.INVALID_ARGUMENT
+                    .withDescription("Validation failed")
+                    .augmentDescription(errorBuilder.build().toString())
+                    .asRuntimeException());
+                return;
+            }
+            
+            // 4. Map protobuf message to Application Core object
+            var customerCommand = mapper.toCreateCommand(request);
+            
+            // 5. Invoke Application Core service
+            var result = customerService.createCustomer(customerCommand);
+            
+            // 7. Process successful response
+            if (result.isSuccess()) {
+                var response = mapper.toGrpcResponse(result.getValue());
+                responseObserver.onNext(response);
+                responseObserver.onCompleted();
+                return;
+            }
+            
+            // 8. Process business logic failures
+            Status status = switch (result.getErrorType()) {
+                case DUPLICATE_EMAIL -> Status.ALREADY_EXISTS
+                    .withDescription("Email already exists");
+                case INVALID_BUSINESS_RULE -> Status.FAILED_PRECONDITION
+                    .withDescription(result.getErrorMessage());
+                case NOT_FOUND -> Status.NOT_FOUND
+                    .withDescription("Resource not found");
+                default -> Status.INVALID_ARGUMENT
+                    .withDescription(result.getErrorMessage());
+            };
+            
+            responseObserver.onError(status.asRuntimeException());
+            
+        } catch (Exception ex) {
+            // 6. Handle unhandled exceptions
+            responseObserver.onError(Status.INTERNAL
+                .withDescription("An internal error occurred")
+                .asRuntimeException());
+        }
+    }
+    
+    private Metadata getCallMetadata() {
+        return Context.current().get(GrpcContextKeys.METADATA_KEY);
+    }
+}
+```
+
+```csharp C#
+public class CustomerGrpcService : CustomerService.CustomerServiceBase {
+    private readonly IAuthenticationService _authService;
+    private readonly IValidationService _validationService;
+    private readonly ICustomerService _customerService;
+    private readonly ICustomerMapper _mapper;
+    
+    public CustomerGrpcService(
+        IAuthenticationService authService,
+        IValidationService validationService,
+        ICustomerService customerService,
+        ICustomerMapper mapper) {
+        _authService = authService;
+        _validationService = validationService;
+        _customerService = customerService;
+        _mapper = mapper;
+    }
+    
+    public override async Task<CreateCustomerResponse> CreateCustomer(
+        CreateCustomerRequest request, 
+        ServerCallContext context) {
+        
+        try {
+            // 1. Authentication & Authorization
+            var authResult = await _authService.AuthenticateAsync(context.RequestHeaders);
+            if (!authResult.IsAuthenticated) {
+                throw new RpcException(new Status(StatusCode.Unauthenticated, 
+                    "Authentication failed"));
+            }
+            
+            if (!await _authService.IsAuthorizedAsync(authResult.User, "customer:create")) {
+                throw new RpcException(new Status(StatusCode.PermissionDenied, 
+                    "Insufficient permissions"));
+            }
+            
+            // 3. Input Validation
+            var validationResult = await _validationService.ValidateAsync(request);
+            if (!validationResult.IsValid) {
+                var trailers = new Metadata();
+                foreach (var error in validationResult.Errors) {
+                    trailers.Add($"validation-error-{error.Field}", error.Message);
+                }
+                
+                throw new RpcException(new Status(StatusCode.InvalidArgument, 
+                    "Validation failed"), trailers);
+            }
+            
+            // 4. Map protobuf message to Application Core object
+            var customerCommand = _mapper.ToCreateCommand(request);
+            
+            // 5. Invoke Application Core service
+            var result = await _customerService.CreateCustomerAsync(customerCommand);
+            
+            // 7. Process successful response
+            if (result.IsSuccess) {
+                return _mapper.ToGrpcResponse(result.Value);
+            }
+            
+            // 8. Process business logic failures
+            var status = result.ErrorType switch {
+                CustomerErrorType.DuplicateEmail => new Status(StatusCode.AlreadyExists, 
+                    "Email already exists"),
+                CustomerErrorType.InvalidBusinessRule => new Status(StatusCode.FailedPrecondition, 
+                    result.ErrorMessage),
+                CustomerErrorType.NotFound => new Status(StatusCode.NotFound, 
+                    "Resource not found"),
+                _ => new Status(StatusCode.InvalidArgument, result.ErrorMessage)
+            };
+            
+            throw new RpcException(status);
+            
+        } catch (RpcException) {
+            throw; // Re-throw gRPC exceptions as-is
+        } catch (Exception ex) {
+            // 6. Handle unhandled exceptions
+            throw new RpcException(new Status(StatusCode.Internal, 
+                "An internal error occurred"));
+        }
+    }
+}
+```
+
+```javascript JavaScript
+// Using @grpc/grpc-js
+class CustomerGrpcService {
+    constructor(authService, validationService, customerService, mapper) {
+        this.authService = authService;
+        this.validationService = validationService;
+        this.customerService = customerService;
+        this.mapper = mapper;
+    }
+    
+    async createCustomer(call, callback) {
+        try {
+            // 1. Authentication & Authorization
+            const authResult = await this.authService.authenticate(call.metadata);
+            if (!authResult.isAuthenticated) {
+                return callback({
+                    code: grpc.status.UNAUTHENTICATED,
+                    details: 'Authentication failed'
+                });
+            }
+            
+            if (!await this.authService.isAuthorized(authResult.user, 'customer:create')) {
+                return callback({
+                    code: grpc.status.PERMISSION_DENIED,
+                    details: 'Insufficient permissions'
+                });
+            }
+            
+            // 2. Receive protobuf message
+            const request = call.request;
+            
+            // 3. Input Validation
+            const validationResult = await this.validationService.validate(request);
+            if (!validationResult.isValid) {
+                const trailers = new grpc.Metadata();
+                validationResult.errors.forEach(error => {
+                    trailers.add(`validation-error-${error.field}`, error.message);
+                });
+                
+                return callback({
+                    code: grpc.status.INVALID_ARGUMENT,
+                    details: 'Validation failed',
+                    metadata: trailers
+                });
+            }
+            
+            // 4. Map protobuf message to Application Core object
+            const customerCommand = this.mapper.toCreateCommand(request);
+            
+            // 5. Invoke Application Core service
+            const result = await this.customerService.createCustomer(customerCommand);
+            
+            // 7. Process successful response
+            if (result.isSuccess) {
+                const response = this.mapper.toGrpcResponse(result.value);
+                return callback(null, response);
+            }
+            
+            // 8. Process business logic failures
+            let statusCode;
+            switch (result.errorType) {
+                case 'DUPLICATE_EMAIL':
+                    statusCode = grpc.status.ALREADY_EXISTS;
+                    break;
+                case 'INVALID_BUSINESS_RULE':
+                    statusCode = grpc.status.FAILED_PRECONDITION;
+                    break;
+                case 'NOT_FOUND':
+                    statusCode = grpc.status.NOT_FOUND;
+                    break;
+                default:
+                    statusCode = grpc.status.INVALID_ARGUMENT;
+            }
+            
+            callback({
+                code: statusCode,
+                details: result.errorMessage
+            });
+            
+        } catch (error) {
+            // 6. Handle unhandled exceptions
+            console.error('Unhandled exception in gRPC service:', error);
+            callback({
+                code: grpc.status.INTERNAL,
+                details: 'An internal error occurred'
+            });
+        }
+    }
+}
+```
+
+```typescript TypeScript
+// Using @grpc/grpc-js with TypeScript
+export class CustomerGrpcService {
+    constructor(
+        private readonly authService: IAuthenticationService,
+        private readonly validationService: IValidationService,
+        private readonly customerService: ICustomerService,
+        private readonly mapper: ICustomerMapper
+    ) {}
+    
+    async createCustomer(
+        call: ServerUnaryCall<CreateCustomerRequest, CreateCustomerResponse>,
+        callback: sendUnaryData<CreateCustomerResponse>
+    ): Promise<void> {
+        
+        try {
+            // 1. Authentication & Authorization
+            const authResult = await this.authService.authenticate(call.metadata);
+            if (!authResult.isAuthenticated) {
+                return callback({
+                    code: status.UNAUTHENTICATED,
+                    details: 'Authentication failed'
+                } as ServiceError);
+            }
+            
+            if (!await this.authService.isAuthorized(authResult.user, 'customer:create')) {
+                return callback({
+                    code: status.PERMISSION_DENIED,
+                    details: 'Insufficient permissions'
+                } as ServiceError);
+            }
+            
+            // 2. Receive protobuf message
+            const request = call.request;
+            
+            // 3. Input Validation
+            const validationResult = await this.validationService.validate(request);
+            if (!validationResult.isValid) {
+                const trailers = new Metadata();
+                validationResult.errors.forEach(error => {
+                    trailers.add(`validation-error-${error.field}`, error.message);
+                });
+                
+                return callback({
+                    code: status.INVALID_ARGUMENT,
+                    details: 'Validation failed',
+                    metadata: trailers
+                } as ServiceError);
+            }
+            
+            // 4. Map protobuf message to Application Core object
+            const customerCommand = this.mapper.toCreateCommand(request);
+            
+            // 5. Invoke Application Core service
+            const result = await this.customerService.createCustomer(customerCommand);
+            
+            // 7. Process successful response
+            if (result.isSuccess) {
+                const response = this.mapper.toGrpcResponse(result.value);
+                return callback(null, response);
+            }
+            
+            // 8. Process business logic failures
+            let statusCode: status;
+            switch (result.errorType) {
+                case CustomerErrorType.DuplicateEmail:
+                    statusCode = status.ALREADY_EXISTS;
+                    break;
+                case CustomerErrorType.InvalidBusinessRule:
+                    statusCode = status.FAILED_PRECONDITION;
+                    break;
+                case CustomerErrorType.NotFound:
+                    statusCode = status.NOT_FOUND;
+                    break;
+                default:
+                    statusCode = status.INVALID_ARGUMENT;
+            }
+            
+            callback({
+                code: statusCode,
+                details: result.errorMessage
+            } as ServiceError);
+            
+        } catch (error) {
+            // 6. Handle unhandled exceptions
+            console.error('Unhandled exception in gRPC service:', error);
+            callback({
+                code: status.INTERNAL,
+                details: 'An internal error occurred'
+            } as ServiceError);
+        }
+    }
+}
+```
+</CodeGroup>
+
+## gRPC Specific Considerations
+
+### **Status Code Guidelines**
+- **OK**: Successful operations
+- **INVALID_ARGUMENT**: Validation failures, malformed requests
+- **UNAUTHENTICATED**: Authentication failures
+- **PERMISSION_DENIED**: Authorization failures
+- **NOT_FOUND**: Resource doesn't exist
+- **ALREADY_EXISTS**: Resource conflicts (duplicate resources)
+- **FAILED_PRECONDITION**: Business rule violations
+- **INTERNAL**: System errors, unhandled exceptions
+
+### **Metadata Usage**
+- **Authentication**: Pass tokens, API keys via request metadata
+- **Error Details**: Include validation errors in response trailers
+- **Tracing**: Propagate correlation IDs and trace context
+
+### **Error Handling Patterns**
+- Use `RpcException` (.NET) or status callbacks (Node.js/Java)
+- Include structured error details in metadata when appropriate
+- Preserve error context without exposing sensitive information
+
+### **Protobuf Conventions**
+```protobuf
+service CustomerService {
+  rpc CreateCustomer(CreateCustomerRequest) returns (CreateCustomerResponse);
+}
+
+message CreateCustomerRequest {
+  string email = 1;
+  string name = 2;
+  CustomerType type = 3;
+}
+
+message CreateCustomerResponse {
+  string id = 1;
+  string email = 2;
+  string name = 3;
+  google.protobuf.Timestamp created_at = 4;
+}
+```
+
+### **Performance Benefits**
+- **Binary Protocol**: Efficient serialization compared to JSON
+- **Schema Evolution**: Backward/forward compatibility via protobuf versioning
+- **HTTP/2**: Multiplexing, server push, header compression
+- **Streaming**: Support for client, server, and bidirectional streaming

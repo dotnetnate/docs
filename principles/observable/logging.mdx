@@ -1,0 +1,690 @@
+---
+title: "Logging"
+---
+
+# Overview
+Effective logging is fundamental to microservice observability. This document establishes minimum requirements, policies, and implementation patterns for structured logging across all microservices.
+
+Good logging practices include:
+
+1. **Structured Format**: Always use JSON-structured logging with standard fields
+2. **PII Protection**: Implement comprehensive data sanitization
+3. **Run-Time Verbosity Changes**: Support runtime log level changes
+4. **Performance**: Use asynchronous, buffered logging
+5. **Compliance**: Meet regulatory requirements for data protection and retention
+6. **Correlation**: Maintain trace/request IDs across service boundaries
+
+This comprehensive logging approach ensures observability while protecting sensitive data and maintaining system performance.
+
+# Creating Useful Log Entries
+- **Be Descriptive**: Clearly describe the event or action being logged.
+- **Include Context**: Add relevant metadata such as user ID, tenant ID, operation name, entity type, and entity ID.
+- **Log at the Appropriate Level**: Use the correct logging level (e.g., INFO, WARN, ERROR) to indicate the severity of the event.
+- **Be Concise**: Avoid excessive verbosity; log only what is necessary and sufficient to understand the event.
+
+<Check>**Always Log**</Check>
+- **Request Entry/Exit**: Service boundaries, controller entry/exit points *(Level: **INFO**)*
+- **Business Operations**: Domain events, state changes, workflow progress *(Level: **INFO**)*
+- **External Calls**: API calls, database operations, message publishing/consuming *(Level: **INFO** for success, **WARN** for retries)*
+- **Authentication/Authorization**: Login attempts, permission checks, token validations *(Level: **INFO** for success, **WARN** for failures)*
+- **Performance Metrics**: Operation durations, resource usage patterns *(Level: **INFO** for normal operations, **WARN** for slow operations)*
+- **Configuration Changes**: Runtime setting modifications, feature flag toggles *(Level: **INFO**)*
+- **Exceptions**: Full stack traces with context (never in production responses) *(Level: **ERROR** for unhandled exceptions, **WARN** for handled exceptions)*
+- **Business Rule Violations**: Validation failures, constraint violations *(Level: **WARN** for validation failures, **INFO** for business rule enforcement)*
+- **Integration Failures**: External service timeouts, circuit breaker trips *(Level: **ERROR** for failures, **WARN** for circuit breaker state changes)*
+- **Data Inconsistencies**: Validation errors, constraint violations *(Level: **ERROR** for data corruption, **WARN** for validation issues)*
+- **Access Attempts**: Failed authentication, authorization denials *(Level: **WARN** for failed attempts, **ERROR** for potential attacks)*
+- **Suspicious Activity**: Rate limiting triggers, unusual access patterns *(Level: **WARN** for rate limiting, **ERROR** for security violations)*
+- **Data Access**: PII access, sensitive operation execution *(Level: **INFO** for authorized access, **WARN** for privileged operations)*
+
+<Warning>**Use Caution When Logging**</Warning>
+
+- **Requests and Response Payloads**: While the content of requests are known up front, responses may contain sensitive data. Log only metadata (status codes, durations) unless the response schema is fully vetted. *(Level: **INFO** for metadata, **DEBUG** for request/response bodies)*
+- **Database Queries**: Only log full query text (with sanitization) at the verbose logging level. Large queries can cause log bloat and incur excessive storage costs as well as impact performance. *(Level: **DEBUG** for query text, **TRACE** for query parameters)*
+
+**High Volume/Low Value Data**
+- **Heartbeat/Health Checks**: Successful health endpoint calls *(Level: **Never log successful checks**, **WARN** for failures only)*
+- **Static Resource Requests**: CSS, JavaScript, image files *(Level: **Never log**, unless debugging specific issues)*
+- **Excessive Debug Information**: Variable dumps, memory states in production *(Level: **TRACE** only, disabled in production)*
+
+
+<Danger>**DO NOT LOG**</Danger>
+None of the following may be logged unless permitted by an exception process and approved by security/compliance teams:
+- **Personally Identifiable Information (PII)**: Names, emails, phone numbers, addresses. Use opaque identifers to refer to users, account numbers or other sensitive entities.
+- **Financial Data**: Credit card numbers, bank accounts, transaction amounts
+- **Authentication Data**: Passwords, tokens, API keys, certificates
+
+
+# Logging Levels & Usage
+
+
+| Level | Purpose | Production Use | Examples |
+|-------|---------|----------------|----------|
+| **TRACE** | Detailed flow tracing | Never | Method entry/exit, loop iterations |
+| **DEBUG** | Development debugging | Conditionally | Variable values, algorithm steps |
+| **INFO** | General information | Always | Business operations, external calls |
+| **WARN** | Potentially harmful situations | Always | Deprecated features, fallback usage |
+| **ERROR** | Error conditions | Always | Exceptions, integration failures |
+| **FATAL** | Critical failures | Always | System-wide failures, data corruption |
+
+## Dynamic Log Level Management
+
+All microservices must support runtime log level changes without redeployment. This can be achieved via the creation of an administrative endpoint or through configuration listeners that respond to changes in external configuration sources (e.g., Consul, etcd).
+
+
+# Structured Logging
+Structured logging involves logging events in a consistent, machine-readable format (e.g., JSON) with defined fields. This enables powerful querying, filtering, and analysis in log management systems. 
+
+<Check>Structured Logging (Preferred)</Check>
+```json
+{
+  "timestamp": "2024-10-02T10:30:15.123Z",
+  "level": "INFO",
+  "message": "Customer created successfully",
+  "traceId": "abc123-def456-ghi789",
+  "spanId": "span-001",
+  "userId": "usr_7f8e9d6c",
+  "tenantId": "tnt_acme_corp",
+  "operation": "CreateCustomer",
+  "entityType": "Customer",
+  "entityId": "cust_98765",
+  "duration": 145,
+  "requestId": "req_unique_123"
+}
+```
+
+**Benefits:**
+- **Queryable**: Easy filtering by any field
+- **PII Safe**: No sensitive data exposed
+- **Correlated**: Trace/span IDs for distributed tracing
+- **Contextual**: Rich metadata for analysis
+
+### Required Structured Fields
+
+
+#### Standard Fields (Always Include)
+```json
+{
+  "timestamp": "ISO 8601 format",
+  "level": "ERROR|WARN|INFO|DEBUG|TRACE",
+  "message": "Human-readable description",
+  "traceId": "Distributed tracing ID",
+  "spanId": "Current span ID",
+  "requestId": "Unique request identifier"
+}
+```
+
+#### Context Fields (Include When Available)
+```json
+{
+  "userId": "Anonymized user identifier",
+  "tenantId": "Tenant/organization identifier",
+  "operation": "Business operation name",
+  "entityType": "Domain entity type",
+  "entityId": "Anonymized entity identifier",
+  "duration": "Operation duration in milliseconds"
+}
+```
+
+#### Error Fields (Include for Errors)
+```json
+{
+  "errorType": "Exception type",
+  "errorCode": "Business error code",
+  "stackTrace": "Full stack trace (never in responses)",
+  "causedBy": "Root cause exception"
+}
+```
+
+### Implementation Examples
+
+<CodeGroup>
+```java Java
+// Spring Boot with Logback and MDC
+@Component
+public class StructuredLogger {
+    
+    private static final Logger log = LoggerFactory.getLogger(StructuredLogger.class);
+    private final ObjectMapper objectMapper;
+    
+    public StructuredLogger() {
+        this.objectMapper = new ObjectMapper();
+    }
+    
+    public void logOperation(String operation, String entityType, String entityId, 
+                           long duration, Map<String, Object> additionalFields) {
+        try {
+            Map<String, Object> logData = new HashMap<>();
+            logData.put("operation", operation);
+            logData.put("entityType", entityType);
+            logData.put("entityId", sanitizeId(entityId));
+            logData.put("duration", duration);
+            logData.put("traceId", MDC.get("traceId"));
+            logData.put("spanId", MDC.get("spanId"));
+            logData.put("userId", MDC.get("userId"));
+            logData.put("tenantId", MDC.get("tenantId"));
+            logData.put("requestId", MDC.get("requestId"));
+            
+            if (additionalFields != null) {
+                additionalFields.forEach((key, value) -> 
+                    logData.put(key, sanitizeValue(key, value)));
+            }
+            
+            log.info("Operation completed: {}", objectMapper.writeValueAsString(logData));
+            
+        } catch (Exception ex) {
+            log.error("Failed to create structured log", ex);
+        }
+    }
+    
+    public void logError(String operation, Exception ex, Map<String, Object> context) {
+        try {
+            Map<String, Object> errorData = new HashMap<>();
+            errorData.put("operation", operation);
+            errorData.put("errorType", ex.getClass().getSimpleName());
+            errorData.put("errorMessage", sanitizeErrorMessage(ex.getMessage()));
+            errorData.put("stackTrace", ExceptionUtils.getStackTrace(ex));
+            errorData.put("traceId", MDC.get("traceId"));
+            errorData.put("spanId", MDC.get("spanId"));
+            errorData.put("userId", MDC.get("userId"));
+            errorData.put("tenantId", MDC.get("tenantId"));
+            
+            if (context != null) {
+                context.forEach((key, value) -> 
+                    errorData.put(key, sanitizeValue(key, value)));
+            }
+            
+            log.error("Operation failed: {}", objectMapper.writeValueAsString(errorData));
+            
+        } catch (Exception logEx) {
+            log.error("Failed to create structured error log", logEx);
+        }
+    }
+    
+    private String sanitizeId(String id) {
+        // Hash or anonymize IDs
+        return "id_" + Integer.toHexString(id.hashCode());
+    }
+    
+    private Object sanitizeValue(String key, Object value) {
+        // Remove PII from sensitive fields
+        if (isPiiField(key)) {
+            return "***REDACTED***";
+        }
+        return value;
+    }
+    
+    private boolean isPiiField(String fieldName) {
+        String lower = fieldName.toLowerCase();
+        return lower.contains("email") || lower.contains("name") || 
+               lower.contains("phone") || lower.contains("address") ||
+               lower.contains("ssn") || lower.contains("password");
+    }
+    
+    private String sanitizeErrorMessage(String message) {
+        if (message == null) return null;
+        
+        // Remove potential PII from error messages
+        return message.replaceAll("\\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Z|a-z]{2,}\\b", "***EMAIL***")
+                     .replaceAll("\\b\\d{3}-\\d{2}-\\d{4}\\b", "***SSN***")
+                     .replaceAll("\\b\\d{3}-\\d{3}-\\d{4}\\b", "***PHONE***");
+    }
+}
+
+// Usage in service classes
+@Service
+public class CustomerService {
+    
+    private final StructuredLogger structuredLogger;
+    
+    public Result<Customer> createCustomer(CreateCustomerCommand command) {
+        long startTime = System.currentTimeMillis();
+        
+        try {
+            // Business logic
+            Customer customer = new Customer(command.getEmail(), command.getName());
+            customerRepository.save(customer);
+            
+            long duration = System.currentTimeMillis() - startTime;
+            
+            Map<String, Object> context = new HashMap<>();
+            context.put("customerType", customer.getType());
+            context.put("source", command.getSource());
+            
+            structuredLogger.logOperation("CreateCustomer", "Customer", 
+                                        customer.getId(), duration, context);
+            
+            return Result.success(customer);
+            
+        } catch (Exception ex) {
+            Map<String, Object> errorContext = new HashMap<>();
+            errorContext.put("commandSource", command.getSource());
+            
+            structuredLogger.logError("CreateCustomer", ex, errorContext);
+            throw ex;
+        }
+    }
+}
+```
+
+```csharp C#
+// ASP.NET Core with Serilog structured logging
+public class StructuredLogger {
+    private readonly ILogger<StructuredLogger> _logger;
+    
+    public StructuredLogger(ILogger<StructuredLogger> logger) {
+        _logger = logger;
+    }
+    
+    public void LogOperation(string operation, string entityType, string entityId, 
+                           long duration, Dictionary<string, object> additionalFields = null) {
+        using var scope = _logger.BeginScope(new Dictionary<string, object> {
+            ["Operation"] = operation,
+            ["EntityType"] = entityType,
+            ["EntityId"] = SanitizeId(entityId),
+            ["Duration"] = duration,
+            ["TraceId"] = Activity.Current?.TraceId.ToString(),
+            ["SpanId"] = Activity.Current?.SpanId.ToString(),
+            ["RequestId"] = Activity.Current?.RootId
+        });
+        
+        var logData = new Dictionary<string, object> {
+            ["operation"] = operation,
+            ["entityType"] = entityType,
+            ["entityId"] = SanitizeId(entityId),
+            ["duration"] = duration
+        };
+        
+        if (additionalFields != null) {
+            foreach (var kvp in additionalFields) {
+                logData[kvp.Key] = SanitizeValue(kvp.Key, kvp.Value);
+            }
+        }
+        
+        _logger.LogInformation("Operation completed: {OperationData}", logData);
+    }
+    
+    public void LogError(string operation, Exception ex, Dictionary<string, object> context = null) {
+        var errorData = new Dictionary<string, object> {
+            ["operation"] = operation,
+            ["errorType"] = ex.GetType().Name,
+            ["errorMessage"] = SanitizeErrorMessage(ex.Message),
+            ["stackTrace"] = ex.ToString(),
+            ["traceId"] = Activity.Current?.TraceId.ToString(),
+            ["spanId"] = Activity.Current?.SpanId.ToString()
+        };
+        
+        if (context != null) {
+            foreach (var kvp in context) {
+                errorData[kvp.Key] = SanitizeValue(kvp.Key, kvp.Value);
+            }
+        }
+        
+        _logger.LogError(ex, "Operation failed: {ErrorData}", errorData);
+    }
+    
+    private string SanitizeId(string id) {
+        return $"id_{id.GetHashCode():X}";
+    }
+    
+    private object SanitizeValue(string key, object value) {
+        if (IsPiiField(key)) {
+            return "***REDACTED***";
+        }
+        return value;
+    }
+    
+    private bool IsPiiField(string fieldName) {
+        var lower = fieldName.ToLower();
+        return lower.Contains("email") || lower.Contains("name") || 
+               lower.Contains("phone") || lower.Contains("address") ||
+               lower.Contains("ssn") || lower.Contains("password");
+    }
+    
+    private string SanitizeErrorMessage(string message) {
+        if (string.IsNullOrEmpty(message)) return message;
+        
+        return Regex.Replace(message, @"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b", "***EMAIL***")
+                   .Replace(Regex.Replace(message, @"\b\d{3}-\d{2}-\d{4}\b", "***SSN***"), "***SSN***")
+                   .Replace(Regex.Replace(message, @"\b\d{3}-\d{3}-\d{4}\b", "***PHONE***"), "***PHONE***");
+    }
+}
+
+// Usage in service classes
+public class CustomerService {
+    private readonly StructuredLogger _structuredLogger;
+    
+    public CustomerService(StructuredLogger structuredLogger) {
+        _structuredLogger = structuredLogger;
+    }
+    
+    public async Task<Result<Customer>> CreateCustomerAsync(CreateCustomerCommand command) {
+        var stopwatch = Stopwatch.StartNew();
+        
+        try {
+            // Business logic
+            var customer = new Customer(command.Email, command.Name);
+            await _customerRepository.SaveAsync(customer);
+            
+            stopwatch.Stop();
+            
+            var context = new Dictionary<string, object> {
+                ["customerType"] = customer.Type,
+                ["source"] = command.Source
+            };
+            
+            _structuredLogger.LogOperation("CreateCustomer", "Customer", 
+                                         customer.Id, stopwatch.ElapsedMilliseconds, context);
+            
+            return Result<Customer>.Success(customer);
+            
+        } catch (Exception ex) {
+            var errorContext = new Dictionary<string, object> {
+                ["commandSource"] = command.Source
+            };
+            
+            _structuredLogger.LogError("CreateCustomer", ex, errorContext);
+            throw;
+        }
+    }
+}
+```
+
+```javascript JavaScript
+// Node.js with Winston structured logging
+const winston = require('winston');
+const crypto = require('crypto');
+
+class StructuredLogger {
+    constructor() {
+        this.logger = winston.createLogger({
+            level: process.env.LOG_LEVEL || 'info',
+            format: winston.format.combine(
+                winston.format.timestamp(),
+                winston.format.errors({ stack: true }),
+                winston.format.json()
+            ),
+            transports: [
+                new winston.transports.Console(),
+                new winston.transports.File({ filename: 'app.log' })
+            ]
+        });
+    }
+    
+    logOperation(operation, entityType, entityId, duration, additionalFields = {}) {
+        const logData = {
+            operation,
+            entityType,
+            entityId: this.sanitizeId(entityId),
+            duration,
+            traceId: this.getTraceId(),
+            spanId: this.getSpanId(),
+            requestId: this.getRequestId(),
+            ...this.sanitizeFields(additionalFields)
+        };
+        
+        this.logger.info('Operation completed', logData);
+    }
+    
+    logError(operation, error, context = {}) {
+        const errorData = {
+            operation,
+            errorType: error.constructor.name,
+            errorMessage: this.sanitizeErrorMessage(error.message),
+            stackTrace: error.stack,
+            traceId: this.getTraceId(),
+            spanId: this.getSpanId(),
+            requestId: this.getRequestId(),
+            ...this.sanitizeFields(context)
+        };
+        
+        this.logger.error('Operation failed', errorData);
+    }
+    
+    sanitizeId(id) {
+        return `id_${crypto.createHash('md5').update(id).digest('hex').substring(0, 8)}`;
+    }
+    
+    sanitizeFields(fields) {
+        const sanitized = {};
+        for (const [key, value] of Object.entries(fields)) {
+            sanitized[key] = this.isPiiField(key) ? '***REDACTED***' : value;
+        }
+        return sanitized;
+    }
+    
+    isPiiField(fieldName) {
+        const lower = fieldName.toLowerCase();
+        return lower.includes('email') || lower.includes('name') || 
+               lower.includes('phone') || lower.includes('address') ||
+               lower.includes('ssn') || lower.includes('password');
+    }
+    
+    sanitizeErrorMessage(message) {
+        if (!message) return message;
+        
+        return message
+            .replace(/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b/g, '***EMAIL***')
+            .replace(/\b\d{3}-\d{2}-\d{4}\b/g, '***SSN***')
+            .replace(/\b\d{3}-\d{3}-\d{4}\b/g, '***PHONE***');
+    }
+    
+    getTraceId() {
+        // Integration with tracing system (OpenTelemetry, etc.)
+        return process.env.TRACE_ID || 'trace-unknown';
+    }
+    
+    getSpanId() {
+        return process.env.SPAN_ID || 'span-unknown';
+    }
+    
+    getRequestId() {
+        return process.env.REQUEST_ID || 'req-unknown';
+    }
+}
+
+// Usage in service classes
+class CustomerService {
+    constructor() {
+        this.structuredLogger = new StructuredLogger();
+    }
+    
+    async createCustomer(command) {
+        const startTime = Date.now();
+        
+        try {
+            // Business logic
+            const customer = new Customer(command.email, command.name);
+            await this.customerRepository.save(customer);
+            
+            const duration = Date.now() - startTime;
+            
+            const context = {
+                customerType: customer.type,
+                source: command.source
+            };
+            
+            this.structuredLogger.logOperation('CreateCustomer', 'Customer', 
+                                             customer.id, duration, context);
+            
+            return { success: true, data: customer };
+            
+        } catch (error) {
+            const errorContext = {
+                commandSource: command.source
+            };
+            
+            this.structuredLogger.logError('CreateCustomer', error, errorContext);
+            throw error;
+        }
+    }
+}
+
+module.exports = { StructuredLogger, CustomerService };
+```
+
+```typescript TypeScript
+// NestJS with Winston structured logging
+import { Injectable } from '@nestjs/common';
+import { createLogger, Logger, format, transports } from 'winston';
+import * as crypto from 'crypto';
+
+interface LogContext {
+    [key: string]: any;
+}
+
+@Injectable()
+export class StructuredLogger {
+    private readonly logger: Logger;
+    
+    constructor() {
+        this.logger = createLogger({
+            level: process.env.LOG_LEVEL || 'info',
+            format: format.combine(
+                format.timestamp(),
+                format.errors({ stack: true }),
+                format.json()
+            ),
+            transports: [
+                new transports.Console(),
+                new transports.File({ filename: 'app.log' })
+            ]
+        });
+    }
+    
+    logOperation(operation: string, entityType: string, entityId: string, 
+                duration: number, additionalFields: LogContext = {}): void {
+        const logData: LogContext = {
+            operation,
+            entityType,
+            entityId: this.sanitizeId(entityId),
+            duration,
+            traceId: this.getTraceId(),
+            spanId: this.getSpanId(),
+            requestId: this.getRequestId(),
+            ...this.sanitizeFields(additionalFields)
+        };
+        
+        this.logger.info('Operation completed', logData);
+    }
+    
+    logError(operation: string, error: Error, context: LogContext = {}): void {
+        const errorData: LogContext = {
+            operation,
+            errorType: error.constructor.name,
+            errorMessage: this.sanitizeErrorMessage(error.message),
+            stackTrace: error.stack,
+            traceId: this.getTraceId(),
+            spanId: this.getSpanId(),
+            requestId: this.getRequestId(),
+            ...this.sanitizeFields(context)
+        };
+        
+        this.logger.error('Operation failed', errorData);
+    }
+    
+    private sanitizeId(id: string): string {
+        return `id_${crypto.createHash('md5').update(id).digest('hex').substring(0, 8)}`;
+    }
+    
+    private sanitizeFields(fields: LogContext): LogContext {
+        const sanitized: LogContext = {};
+        for (const [key, value] of Object.entries(fields)) {
+            sanitized[key] = this.isPiiField(key) ? '***REDACTED***' : value;
+        }
+        return sanitized;
+    }
+    
+    private isPiiField(fieldName: string): boolean {
+        const lower = fieldName.toLowerCase();
+        return lower.includes('email') || lower.includes('name') || 
+               lower.includes('phone') || lower.includes('address') ||
+               lower.includes('ssn') || lower.includes('password');
+    }
+    
+    private sanitizeErrorMessage(message: string): string {
+        if (!message) return message;
+        
+        return message
+            .replace(/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b/g, '***EMAIL***')
+            .replace(/\b\d{3}-\d{2}-\d{4}\b/g, '***SSN***')
+            .replace(/\b\d{3}-\d{3}-\d{4}\b/g, '***PHONE***');
+    }
+    
+    private getTraceId(): string {
+        return process.env.TRACE_ID || 'trace-unknown';
+    }
+    
+    private getSpanId(): string {
+        return process.env.SPAN_ID || 'span-unknown';
+    }
+    
+    private getRequestId(): string {
+        return process.env.REQUEST_ID || 'req-unknown';
+    }
+}
+
+// Usage in service classes
+@Injectable()
+export class CustomerService {
+    constructor(private readonly structuredLogger: StructuredLogger) {}
+    
+    async createCustomer(command: CreateCustomerCommand): Promise<Result<Customer>> {
+        const startTime = Date.now();
+        
+        try {
+            // Business logic
+            const customer = new Customer(command.email, command.name);
+            await this.customerRepository.save(customer);
+            
+            const duration = Date.now() - startTime;
+            
+            const context = {
+                customerType: customer.type,
+                source: command.source
+            };
+            
+            this.structuredLogger.logOperation('CreateCustomer', 'Customer', 
+                                             customer.id, duration, context);
+            
+            return Result.success(customer);
+            
+        } catch (error) {
+            const errorContext = {
+                commandSource: command.source
+            };
+            
+            this.structuredLogger.logError('CreateCustomer', error as Error, errorContext);
+            throw error;
+        }
+    }
+}
+```
+</CodeGroup>
+
+<Warning>Basic Logging (Avoid)</Warning>
+```
+INFO 2024-10-02 10:30:15 - User john.doe@example.com created customer with ID 12345 for tenant acme-corp
+ERROR 2024-10-02 10:31:22 - Failed to process payment $150.00 for customer 12345: Insufficient funds
+```
+
+**Problems:**
+- **Unstructured**: Difficult to parse and query
+- **PII Exposure**: Email addresses, amounts visible in logs
+- **Poor Searchability**: Cannot filter by structured fields
+- **No Context**: Missing correlation IDs, request tracing
+
+# Performance Considerations
+
+## **Log Volume Management**
+
+### **Sampling Strategies**
+- **High-Volume Operations**: Sample successful operations (e.g., 1% for health checks)
+- **Critical Operations**: Log all instances (payments, user creation, security events)
+- **Debug Logging**: Automatic timeout/disabling in production
+
+### **Asynchronous Logging**
+- **Non-Blocking**: Use async appenders to prevent I/O blocking
+- **Buffering**: Batch log writes for better performance
+- **Circuit Breakers**: Prevent logging system failures from affecting application
+

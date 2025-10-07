@@ -1,0 +1,394 @@
+---
+title: "Resiliency Patterns"
+description: "Common resiliency patterns for handling faults in microservices with decision guidance and implementation examples."
+---
+
+# Resiliency Patterns
+
+Resiliency patterns help microservices handle external dependencies gracefully. Use these patterns as part of fault handling policies when dealing with external resources.
+
+## Pattern Selection Guide
+
+| **Situation** | **Recommended Pattern** | **When to Use** | **When to Avoid** |
+|---------------|------------------------|-----------------|-------------------|
+| **Temporary network issues, throttling** | **Retry** | Transient faults, idempotent operations | Permanent failures, non-idempotent operations |
+| **Downstream service is unhealthy** | **Circuit Breaker** | Preventing cascading failures, resource protection | Fast failure not critical, high reliability deps |
+| **Calls taking too long** | **Timeout** | Avoiding indefinite waits, resource management | Long-running operations by design |
+| **Service unavailable but degraded mode OK** | **Fallback** | Graceful degradation acceptable | Correctness critical, stale data harmful |
+| **Resource contention, multi-tenant systems** | **Bulkhead** | Isolating failure domains, shared resources | Simple services, minimal concurrency |
+
+## Pattern Details
+
+### Retry Pattern
+
+The retry pattern handles transient faults by automatically retrying failed operations with exponential backoff and jitter.
+
+**Key Considerations:**
+- Apply exponential backoff with jitter to avoid thundering herd
+- Cap retry attempts to prevent infinite loops
+- Only use with idempotent operations
+
+<CodeGroup>
+```java Java
+// Java (Resilience4j)
+RetryConfig config = RetryConfig.custom()
+    .maxAttempts(3)
+    .waitDuration(Duration.ofMillis(200))
+    .build();
+Retry retry = Retry.of("serviceRetry", config);
+
+Supplier<String> supplier = Retry.decorateSupplier(retry, () -> 
+    restTemplate.getForObject("https://api.example.com/data", String.class));
+String result = supplier.get();
+System.out.println(result);
+```
+
+```csharp C#
+// C# (.NET / Polly)
+var policy = Policy.Handle<HttpRequestException>()
+    .WaitAndRetryAsync(3, retryAttempt => 
+        TimeSpan.FromSeconds(Math.Pow(2, retryAttempt)));
+
+var client = new HttpClient();
+var response = await policy.ExecuteAsync(() => 
+    client.GetAsync("https://api.example.com/data"));
+if (response.IsSuccessStatusCode) {
+    var data = await response.Content.ReadAsStringAsync();
+    Console.WriteLine(data);
+}
+```
+
+```javascript JavaScript
+// JavaScript (axios-retry)
+const axios = require('axios');
+const axiosRetry = require('axios-retry');
+axiosRetry(axios, { 
+    retries: 3, 
+    retryDelay: axiosRetry.exponentialDelay 
+});
+
+try {
+    const response = await axios.get('https://api.example.com/data');
+    console.log(response.data);
+} catch (err) {
+    console.error('Request failed:', err);
+}
+```
+
+```typescript TypeScript
+// TypeScript (axios-retry)
+import axios from 'axios';
+import axiosRetry from 'axios-retry';
+
+axiosRetry(axios, { 
+    retries: 3, 
+    retryDelay: axiosRetry.exponentialDelay 
+});
+
+try {
+    const response = await axios.get('https://api.example.com/data');
+    console.log(response.data);
+} catch (err) {
+    console.error('Request failed:', err);
+}
+```
+</CodeGroup>
+
+---
+
+### Circuit Breaker Pattern
+
+The circuit breaker pattern prevents cascading failures by monitoring failure rates and temporarily blocking calls to unhealthy services.
+
+**Key Considerations:**
+- Configure appropriate failure thresholds and timeout periods
+- Provide meaningful fallback responses when circuit is open
+- Monitor circuit state for operational insights
+
+<CodeGroup>
+```java Java
+// Java (Resilience4j)
+CircuitBreakerConfig cbConfig = CircuitBreakerConfig.ofDefaults();
+CircuitBreaker cb = CircuitBreaker.of("myCB", cbConfig);
+Supplier<String> decorated = CircuitBreaker.decorateSupplier(cb, () -> 
+    restTemplate.getForObject("https://api.example.com/unstable", String.class));
+String result = Try.ofSupplier(decorated).recover(ex -> "fallback").get();
+System.out.println(result);
+```
+
+```csharp C#
+// C# (.NET / Polly)
+var policy = Policy.Handle<HttpRequestException>()
+    .CircuitBreakerAsync(5, TimeSpan.FromSeconds(30));
+
+try {
+    var response = await policy.ExecuteAsync(() => 
+        client.GetAsync("https://api.example.com/unstable"));
+    Console.WriteLine(await response.Content.ReadAsStringAsync());
+}
+catch (BrokenCircuitException) {
+    Console.WriteLine("Circuit is open, skipping call");
+}
+```
+
+```javascript JavaScript
+// JavaScript (Opossum)
+const CircuitBreaker = require('opossum');
+
+async function apiCall() { 
+    return (await axios.get('https://api.example.com/unstable')).data; 
+}
+
+const breaker = new CircuitBreaker(apiCall, { 
+    timeout: 3000, 
+    errorThresholdPercentage: 50, 
+    resetTimeout: 10000 
+});
+
+breaker.fallback(() => 'fallback data');
+
+breaker.fire()
+    .then(data => console.log(data))
+    .catch(err => console.error('Circuit breaker error:', err));
+```
+
+```typescript TypeScript
+// TypeScript (Opossum)
+import CircuitBreaker from 'opossum';
+import axios from 'axios';
+
+async function apiCall(): Promise<any> { 
+    return (await axios.get('https://api.example.com/unstable')).data; 
+}
+
+const breaker = new CircuitBreaker(apiCall, { 
+    timeout: 3000, 
+    errorThresholdPercentage: 50, 
+    resetTimeout: 10000 
+});
+
+breaker.fallback(() => 'fallback data');
+
+breaker.fire()
+    .then(data => console.log(data))
+    .catch(err => console.error('Circuit breaker error:', err));
+```
+</CodeGroup>
+
+---
+
+### Timeout Pattern
+
+The timeout pattern ensures operations don't wait indefinitely by setting maximum wait times for external calls.
+
+**Key Considerations:**
+- Set appropriate timeout values based on SLA requirements
+- Consider different timeouts for different operations
+- Provide clear timeout error handling
+
+<CodeGroup>
+```java Java
+// Java (Spring WebClient)
+WebClient client = WebClient.builder()
+    .clientConnector(new ReactorClientHttpConnector(
+        HttpClient.create().responseTimeout(Duration.ofSeconds(5))))
+    .build();
+
+try {
+    String result = client.get()
+        .uri("https://api.example.com/slow")
+        .retrieve()
+        .bodyToMono(String.class)
+        .block();
+    System.out.println(result);
+} catch (Exception e) {
+    System.out.println("Request timed out");
+}
+```
+
+```csharp C#
+// C# (.NET)
+var client = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
+
+try {
+    var response = await client.GetAsync("https://api.example.com/slow");
+    Console.WriteLine(await response.Content.ReadAsStringAsync());
+}
+catch (TaskCanceledException) {
+    Console.WriteLine("Request timed out");
+}
+```
+
+```javascript JavaScript
+// JavaScript (axios)
+const client = axios.create({ timeout: 5000 });
+
+try {
+    const response = await client.get('https://api.example.com/slow');
+    console.log(response.data);
+} catch (e) {
+    console.error('Timed out or failed:', e.message);
+}
+```
+
+```typescript TypeScript
+// TypeScript (axios)
+import axios from 'axios';
+
+const client = axios.create({ timeout: 5000 });
+
+try {
+    const response = await client.get('https://api.example.com/slow');
+    console.log(response.data);
+} catch (e: any) {
+    console.error('Timed out or failed:', e.message);
+}
+```
+</CodeGroup>
+
+---
+
+### Fallback Pattern
+
+The fallback pattern provides alternative responses when primary services are unavailable, enabling graceful degradation.
+
+**Key Considerations:**
+- Ensure fallback data is appropriate for the use case
+- Consider data freshness requirements
+- Monitor fallback usage for capacity planning
+
+<CodeGroup>
+```java Java
+// Java (Resilience4j)
+Supplier<String> supplier = () -> 
+    restTemplate.getForObject("https://api.example.com/maybeDown", String.class);
+Supplier<String> decorated = Decorators.ofSupplier(supplier)
+    .withRetry(retry)
+    .withCircuitBreaker(cb)
+    .withFallback(Collections.singletonMap(Exception.class, ex -> "fallback"))
+    .decorate();
+String result = decorated.get();
+System.out.println(result);
+```
+
+```csharp C#
+// C# (.NET / Polly)
+var fallback = Policy<HttpResponseMessage>
+    .Handle<Exception>()
+    .FallbackAsync(new HttpResponseMessage(HttpStatusCode.OK) {
+        Content = new StringContent("Fallback data") 
+    });
+
+var response = await fallback.ExecuteAsync(() => 
+    client.GetAsync("https://api.example.com/maybeDown"));
+Console.WriteLine(await response.Content.ReadAsStringAsync());
+```
+
+```javascript JavaScript
+// JavaScript (custom implementation)
+async function callWithFallback() {
+    try {
+        const response = await axios.get('https://api.example.com/maybeDown');
+        return response.data;
+    } catch (e) {
+        return 'cached fallback data';
+    }
+}
+
+console.log(await callWithFallback());
+```
+
+```typescript TypeScript
+// TypeScript (custom implementation)
+import axios from 'axios';
+
+async function callWithFallback(): Promise<any> {
+    try {
+        const response = await axios.get('https://api.example.com/maybeDown');
+        return response.data;
+    } catch (e) {
+        return 'cached fallback data';
+    }
+}
+
+console.log(await callWithFallback());
+```
+</CodeGroup>
+
+---
+
+### Bulkhead Pattern
+
+The bulkhead pattern isolates resource pools to prevent failures in one component from affecting others, similar to watertight compartments in ships.
+
+**Key Considerations:**
+- Size resource pools based on expected load and criticality
+- Monitor resource utilization across bulkheads
+- Balance isolation with resource efficiency
+
+<CodeGroup>
+```java Java
+// Java (Resilience4j)
+BulkheadConfig config = BulkheadConfig.custom()
+    .maxConcurrentCalls(10)
+    .build();
+Bulkhead bulkhead = Bulkhead.of("myBulkhead", config);
+
+Runnable decorated = Bulkhead.decorateRunnable(bulkhead, () -> {
+    String result = restTemplate.getForObject("https://api.example.com/data", String.class);
+    System.out.println(result);
+});
+
+decorated.run();
+```
+
+```csharp C#
+// C# (.NET / Polly Bulkhead)
+var bulkhead = Policy.BulkheadAsync(10, 20);
+
+await bulkhead.ExecuteAsync(async () => {
+    var response = await client.GetAsync("https://api.example.com/data");
+    Console.WriteLine(await response.Content.ReadAsStringAsync());
+});
+```
+
+```javascript JavaScript
+// JavaScript (Bottleneck)
+const Bottleneck = require("bottleneck");
+const limiter = new Bottleneck({ maxConcurrent: 5 });
+
+async function fetchData() {
+    const response = await axios.get('https://api.example.com/data');
+    console.log(response.data);
+}
+
+limiter.schedule(() => fetchData());
+```
+
+```typescript TypeScript
+// TypeScript (Bottleneck)
+import Bottleneck from 'bottleneck';
+import axios from 'axios';
+
+const limiter = new Bottleneck({ maxConcurrent: 5 });
+
+async function fetchData(): Promise<void> {
+    const response = await axios.get('https://api.example.com/data');
+    console.log(response.data);
+}
+
+limiter.schedule(() => fetchData());
+```
+</CodeGroup>
+
+## Combining Patterns
+
+In practice, these patterns work best when combined. A typical resilient service might use:
+
+1. **Timeout** → Set maximum wait time
+2. **Retry** → Handle transient failures  
+3. **Circuit Breaker** → Prevent cascading failures
+4. **Fallback** → Provide graceful degradation
+5. **Bulkhead** → Isolate different service calls
+
+This layered approach provides comprehensive protection against various failure modes while maintaining service availability.

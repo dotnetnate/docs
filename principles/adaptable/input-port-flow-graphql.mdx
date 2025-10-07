@@ -1,0 +1,432 @@
+---
+title: "GraphQL Input Port Flow"
+description: "Implementation pattern for GraphQL input ports with protocol-specific guidance and code examples."
+---
+
+# GraphQL Input Port Flow
+
+This document shows how to implement the universal input port flow pattern specifically for GraphQL resolvers, including appropriate error handling and GraphQL conventions.
+
+## GraphQL Specific Flow
+
+1. **Authenticate and authorize** the request using GraphQL context (HTTP headers, tokens, etc.). Return authentication/authorization errors in the GraphQL errors array.
+
+2. **Receive inbound GraphQL operation** with typed arguments via resolver parameters and selection sets.
+
+3. **Validate input arguments** against GraphQL schema and business rules. Return field-level validation errors in the GraphQL response.
+
+4. **Map GraphQL arguments** to Application Core command/query objects using dedicated mappers.
+
+5. **Invoke Application Core service** with mapped objects to execute business logic.
+
+6. **Handle system exceptions** with GraphQL error handling. Return structured errors with appropriate error codes.
+
+7. **Process successful business operations**:
+   - Return data object matching the GraphQL schema
+   - Support partial success with field-level error handling
+   - Respect GraphQL selection sets for efficient data fetching
+
+8. **Process business logic failures**:
+   - Return errors in the GraphQL errors array
+   - Use error extensions for structured error information
+   - Support partial responses where applicable
+
+## Implementation Example
+
+<CodeGroup>
+```java Java
+// Using GraphQL Java with Spring Boot
+@Component
+public class CustomerResolver implements GraphQLResolver<Query> {
+    private final IAuthenticationService authService;
+    private final IValidationService validationService;
+    private final ICustomerService customerService;
+    private final ICustomerMapper mapper;
+    
+    public CustomerResolver(IAuthenticationService authService,
+                           IValidationService validationService,
+                           ICustomerService customerService,
+                           ICustomerMapper mapper) {
+        this.authService = authService;
+        this.validationService = validationService;
+        this.customerService = customerService;
+        this.mapper = mapper;
+    }
+    
+    @GraphQLMutation
+    public Customer createCustomer(@Argument CreateCustomerInput input, 
+                                  DataFetchingEnvironment env) {
+        try {
+            // 1. Authentication & Authorization
+            var context = env.getContext();
+            var authResult = authService.authenticate(context);
+            if (!authResult.isAuthenticated()) {
+                throw new GraphQLError("Authentication failed", 
+                    ErrorType.ValidationError, 
+                    env.getField().getSourceLocation());
+            }
+            
+            if (!authService.isAuthorized(authResult.getUser(), "customer:create")) {
+                throw new GraphQLError("Insufficient permissions", 
+                    ErrorType.ValidationError,
+                    env.getField().getSourceLocation());
+            }
+            
+            // 3. Input Validation
+            var validationResult = validationService.validate(input);
+            if (!validationResult.isValid()) {
+                var errors = validationResult.getErrors().stream()
+                    .map(error -> GraphQLError.newError()
+                        .message(error.getMessage())
+                        .path(env.getExecutionStepInfo().getPath())
+                        .extension("field", error.getField())
+                        .extension("code", "VALIDATION_ERROR")
+                        .build())
+                    .collect(Collectors.toList());
+                
+                throw new MultipleGraphQLErrors(errors);
+            }
+            
+            // 4. Map GraphQL input to Application Core object
+            var customerCommand = mapper.toCreateCommand(input);
+            
+            // 5. Invoke Application Core service
+            var result = customerService.createCustomer(customerCommand);
+            
+            // 7. Process successful response
+            if (result.isSuccess()) {
+                return mapper.toGraphQLResponse(result.getValue());
+            }
+            
+            // 8. Process business logic failures
+            var errorCode = switch (result.getErrorType()) {
+                case DUPLICATE_EMAIL -> "DUPLICATE_EMAIL";
+                case INVALID_BUSINESS_RULE -> "BUSINESS_RULE_VIOLATION";
+                case NOT_FOUND -> "NOT_FOUND";
+                default -> "BAD_USER_INPUT";
+            };
+            
+            throw GraphQLError.newError()
+                .message(result.getErrorMessage())
+                .path(env.getExecutionStepInfo().getPath())
+                .extension("code", errorCode)
+                .extension("errorType", result.getErrorType().toString())
+                .build();
+            
+        } catch (GraphQLError e) {
+            throw e; // Re-throw GraphQL errors as-is
+        } catch (Exception ex) {
+            // 6. Handle unhandled exceptions
+            throw GraphQLError.newError()
+                .message("An internal error occurred")
+                .path(env.getExecutionStepInfo().getPath())
+                .extension("code", "INTERNAL_ERROR")
+                .build();
+        }
+    }
+}
+```
+
+```csharp C#
+// Using GraphQL.NET
+public class CustomerMutation : ObjectGraphType {
+    public CustomerMutation(
+        IAuthenticationService authService,
+        IValidationService validationService,
+        ICustomerService customerService,
+        ICustomerMapper mapper) {
+        
+        Field<CustomerType>("createCustomer")
+            .Argument<NonNullGraphType<CreateCustomerInputType>>("input")
+            .ResolveAsync(async context => {
+                try {
+                    // 1. Authentication & Authorization
+                    var userContext = context.UserContext as GraphQLUserContext;
+                    var authResult = await authService.AuthenticateAsync(userContext.HttpContext);
+                    if (!authResult.IsAuthenticated) {
+                        context.Errors.Add(new ExecutionError("Authentication failed") {
+                            Code = "UNAUTHENTICATED"
+                        });
+                        return null;
+                    }
+                    
+                    if (!await authService.IsAuthorizedAsync(authResult.User, "customer:create")) {
+                        context.Errors.Add(new ExecutionError("Insufficient permissions") {
+                            Code = "FORBIDDEN"
+                        });
+                        return null;
+                    }
+                    
+                    // 2. Receive GraphQL input
+                    var input = context.GetArgument<CreateCustomerInput>("input");
+                    
+                    // 3. Input Validation
+                    var validationResult = await validationService.ValidateAsync(input);
+                    if (!validationResult.IsValid) {
+                        foreach (var error in validationResult.Errors) {
+                            context.Errors.Add(new ExecutionError(error.Message) {
+                                Code = "VALIDATION_ERROR",
+                                Extensions = new Dictionary<string, object> {
+                                    ["field"] = error.Field
+                                }
+                            });
+                        }
+                        return null;
+                    }
+                    
+                    // 4. Map GraphQL input to Application Core object
+                    var customerCommand = mapper.ToCreateCommand(input);
+                    
+                    // 5. Invoke Application Core service
+                    var result = await customerService.CreateCustomerAsync(customerCommand);
+                    
+                    // 7. Process successful response
+                    if (result.IsSuccess) {
+                        return mapper.ToGraphQLResponse(result.Value);
+                    }
+                    
+                    // 8. Process business logic failures
+                    var errorCode = result.ErrorType switch {
+                        CustomerErrorType.DuplicateEmail => "DUPLICATE_EMAIL",
+                        CustomerErrorType.InvalidBusinessRule => "BUSINESS_RULE_VIOLATION",
+                        CustomerErrorType.NotFound => "NOT_FOUND",
+                        _ => "BAD_USER_INPUT"
+                    };
+                    
+                    context.Errors.Add(new ExecutionError(result.ErrorMessage) {
+                        Code = errorCode,
+                        Extensions = new Dictionary<string, object> {
+                            ["errorType"] = result.ErrorType.ToString()
+                        }
+                    });
+                    return null;
+                    
+                } catch (Exception ex) {
+                    // 6. Handle unhandled exceptions
+                    context.Errors.Add(new ExecutionError("An internal error occurred") {
+                        Code = "INTERNAL_ERROR"
+                    });
+                    return null;
+                }
+            });
+    }
+}
+```
+
+```javascript JavaScript
+// Using Apollo Server
+const resolvers = {
+    Mutation: {
+        createCustomer: async (parent, { input }, context) => {
+            try {
+                // 1. Authentication & Authorization
+                const authResult = await authService.authenticate(context.req);
+                if (!authResult.isAuthenticated) {
+                    throw new AuthenticationError('Authentication failed');
+                }
+                
+                if (!await authService.isAuthorized(authResult.user, 'customer:create')) {
+                    throw new ForbiddenError('Insufficient permissions');
+                }
+                
+                // 3. Input Validation
+                const validationResult = await validationService.validate(input);
+                if (!validationResult.isValid) {
+                    throw new UserInputError('Validation failed', {
+                        validationErrors: validationResult.errors.reduce((acc, error) => {
+                            acc[error.field] = error.message;
+                            return acc;
+                        }, {})
+                    });
+                }
+                
+                // 4. Map GraphQL input to Application Core object
+                const customerCommand = mapper.toCreateCommand(input);
+                
+                // 5. Invoke Application Core service
+                const result = await customerService.createCustomer(customerCommand);
+                
+                // 7. Process successful response
+                if (result.isSuccess) {
+                    return mapper.toGraphQLResponse(result.value);
+                }
+                
+                // 8. Process business logic failures
+                switch (result.errorType) {
+                    case 'DUPLICATE_EMAIL':
+                        throw new UserInputError('Email already exists', {
+                            errorCode: 'DUPLICATE_EMAIL'
+                        });
+                    case 'INVALID_BUSINESS_RULE':
+                        throw new UserInputError(result.errorMessage, {
+                            errorCode: 'BUSINESS_RULE_VIOLATION'
+                        });
+                    case 'NOT_FOUND':
+                        throw new UserInputError('Resource not found', {
+                            errorCode: 'NOT_FOUND'
+                        });
+                    default:
+                        throw new UserInputError(result.errorMessage, {
+                            errorCode: 'BAD_USER_INPUT'
+                        });
+                }
+                
+            } catch (error) {
+                if (error instanceof ApolloError) {
+                    throw error; // Re-throw GraphQL errors as-is
+                }
+                
+                // 6. Handle unhandled exceptions
+                console.error('Unhandled exception in GraphQL resolver:', error);
+                throw new ApolloError('An internal error occurred', 'INTERNAL_ERROR');
+            }
+        }
+    }
+};
+```
+
+```typescript TypeScript
+// Using TypeGraphQL
+@Resolver()
+export class CustomerResolver {
+    constructor(
+        private readonly authService: IAuthenticationService,
+        private readonly validationService: IValidationService,
+        private readonly customerService: ICustomerService,
+        private readonly mapper: ICustomerMapper
+    ) {}
+    
+    @Mutation(() => Customer)
+    async createCustomer(
+        @Arg('input') input: CreateCustomerInput,
+        @Ctx() context: GraphQLContext
+    ): Promise<Customer> {
+        
+        try {
+            // 1. Authentication & Authorization
+            const authResult = await this.authService.authenticate(context.req);
+            if (!authResult.isAuthenticated) {
+                throw new AuthenticationError('Authentication failed');
+            }
+            
+            if (!await this.authService.isAuthorized(authResult.user, 'customer:create')) {
+                throw new ForbiddenError('Insufficient permissions');
+            }
+            
+            // 3. Input Validation
+            const validationResult = await this.validationService.validate(input);
+            if (!validationResult.isValid) {
+                const validationErrors: Record<string, string> = {};
+                validationResult.errors.forEach(error => {
+                    validationErrors[error.field] = error.message;
+                });
+                
+                throw new UserInputError('Validation failed', {
+                    validationErrors
+                });
+            }
+            
+            // 4. Map GraphQL input to Application Core object
+            const customerCommand = this.mapper.toCreateCommand(input);
+            
+            // 5. Invoke Application Core service
+            const result = await this.customerService.createCustomer(customerCommand);
+            
+            // 7. Process successful response
+            if (result.isSuccess) {
+                return this.mapper.toGraphQLResponse(result.value);
+            }
+            
+            // 8. Process business logic failures
+            switch (result.errorType) {
+                case CustomerErrorType.DuplicateEmail:
+                    throw new UserInputError('Email already exists', {
+                        errorCode: 'DUPLICATE_EMAIL'
+                    });
+                case CustomerErrorType.InvalidBusinessRule:
+                    throw new UserInputError(result.errorMessage, {
+                        errorCode: 'BUSINESS_RULE_VIOLATION'
+                    });
+                case CustomerErrorType.NotFound:
+                    throw new UserInputError('Resource not found', {
+                        errorCode: 'NOT_FOUND'
+                    });
+                default:
+                    throw new UserInputError(result.errorMessage, {
+                        errorCode: 'BAD_USER_INPUT'
+                    });
+            }
+            
+        } catch (error) {
+            if (error instanceof ApolloError) {
+                throw error; // Re-throw GraphQL errors as-is
+            }
+            
+            // 6. Handle unhandled exceptions
+            console.error('Unhandled exception in GraphQL resolver:', error);
+            throw new ApolloError('An internal error occurred', 'INTERNAL_ERROR');
+        }
+    }
+}
+```
+</CodeGroup>
+
+## GraphQL Specific Considerations
+
+### **Error Handling Patterns**
+- **Field-level errors**: Include errors in the GraphQL errors array
+- **Partial responses**: Return data with errors for partial success scenarios
+- **Error extensions**: Use extensions for structured error information (error codes, validation details)
+
+### **Error Response Format**
+```json
+{
+  "data": null,
+  "errors": [
+    {
+      "message": "Validation failed",
+      "locations": [{ "line": 2, "column": 3 }],
+      "path": ["createCustomer"],
+      "extensions": {
+        "code": "VALIDATION_ERROR",
+        "field": "email",
+        "validationErrors": {
+          "email": "Email address is required"
+        }
+      }
+    }
+  ]
+}
+```
+
+### **Authentication & Authorization**
+- **Context-based**: Pass authentication info via GraphQL context
+- **Field-level**: Apply authorization at the field level for fine-grained control
+- **Directive-based**: Use schema directives for declarative authorization
+
+### **Schema Design**
+```graphql
+type Mutation {
+  createCustomer(input: CreateCustomerInput!): Customer
+}
+
+input CreateCustomerInput {
+  email: String!
+  name: String!
+  type: CustomerType!
+}
+
+type Customer {
+  id: ID!
+  email: String!
+  name: String!
+  type: CustomerType!
+  createdAt: DateTime!
+}
+```
+
+### **Performance Considerations**
+- **N+1 Problem**: Use DataLoader pattern for efficient data fetching
+- **Selection Sets**: Respect GraphQL selection sets to avoid over-fetching
+- **Query Complexity**: Implement query complexity analysis and limits
+- **Caching**: Use field-level caching for expensive operations

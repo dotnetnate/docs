@@ -1,0 +1,1015 @@
+---
+title: "REST Input Port Flow"
+description: "Implementation pattern for RESTful input ports with resource-based conventions and code examples."
+---
+
+# REST Input Port Flow
+
+This document shows how to implement the universal input port flow pattern specifically for RESTful APIs, including resource-based conventions, proper HTTP verb usage, and RESTful design principles.
+
+## REST Specific Flow
+
+1. **Authenticate and authorize** the request using RESTful authentication mechanisms (Bearer tokens, API keys, OAuth). Return **401 Unauthorized** for authentication failures or **403 Forbidden** for authorization failures.
+
+2. **Receive RESTful HTTP request** with resource-based URLs, appropriate HTTP verbs, and representation formats (JSON, XML, HAL).
+
+3. **Validate request representation** against resource schema and RESTful constraints. Return **400 Bad Request** with validation error details for invalid representations.
+
+4. **Map REST representation** to Application Core command/query objects using dedicated mappers that understand resource semantics.
+
+5. **Invoke Application Core service** with mapped objects to execute resource operations.
+
+6. **Handle system exceptions** with global exception handlers. Return **500 Internal Server Error** with sanitized error messages.
+
+7. **Process successful resource operations**:
+   - **200 OK**: Successful GET, PUT, PATCH operations with resource representation
+   - **201 Created**: Successful POST operations with Location header pointing to new resource
+   - **204 No Content**: Successful DELETE operations or updates with no response body
+   - **202 Accepted**: Asynchronous operations that will complete later
+
+8. **Process RESTful business failures**:
+   - **404 Not Found**: Resource doesn't exist at the specified URI
+   - **409 Conflict**: Resource state conflicts (optimistic concurrency, duplicate resources)
+   - **422 Unprocessable Entity**: Valid request format but business rule violations
+   - **412 Precondition Failed**: Conditional requests that fail (If-Match, If-None-Match)
+
+## Implementation Example
+
+<CodeGroup>
+```java Java
+@RestController
+@RequestMapping("/api/v1/customers")
+public class CustomerRestController {
+    private final IAuthenticationService authService;
+    private final IValidationService validationService;
+    private final ICustomerService customerService;
+    private final ICustomerMapper mapper;
+    private final IHateoasLinkBuilder linkBuilder;
+    
+    public CustomerRestController(IAuthenticationService authService,
+                                 IValidationService validationService,
+                                 ICustomerService customerService,
+                                 ICustomerMapper mapper,
+                                 IHateoasLinkBuilder linkBuilder) {
+        this.authService = authService;
+        this.validationService = validationService;
+        this.customerService = customerService;
+        this.mapper = mapper;
+        this.linkBuilder = linkBuilder;
+    }
+    
+    // POST /api/v1/customers - Create new customer resource
+    @PostMapping
+    public ResponseEntity<?> createCustomer(
+            @RequestBody @Valid CustomerRepresentation customerRep,
+            HttpServletRequest request) {
+        
+        // 1. Authentication & Authorization
+        var authResult = authService.authenticate(request);
+        if (!authResult.isAuthenticated()) {
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
+                .body(createErrorRepresentation("Authentication required", "UNAUTHENTICATED"));
+        }
+        
+        if (!authService.isAuthorized(authResult.getUser(), "customers:create")) {
+            return ResponseEntity.status(HttpStatus.FORBIDDEN)
+                .body(createErrorRepresentation("Insufficient permissions", "FORBIDDEN"));
+        }
+        
+        // 3. Validate REST representation
+        var validationResult = validationService.validate(customerRep);
+        if (!validationResult.isValid()) {
+            var errorRep = createValidationErrorRepresentation(validationResult.getErrors());
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(errorRep);
+        }
+        
+        // 4. Map REST representation to Application Core object
+        var createCommand = mapper.toCreateCommand(customerRep);
+        
+        try {
+            // 5. Invoke Application Core service
+            var result = customerService.createCustomer(createCommand);
+            
+            // 7. Process successful resource creation
+            if (result.isSuccess()) {
+                var customer = result.getValue();
+                var responseRep = mapper.toRepresentation(customer);
+                
+                // Add HATEOAS links
+                responseRep.addLink(linkBuilder.linkToSelf("customers", customer.getId()));
+                responseRep.addLink(linkBuilder.linkToCollection("customers"));
+                
+                var location = URI.create("/api/v1/customers/" + customer.getId());
+                return ResponseEntity.created(location)
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .body(responseRep);
+            }
+            
+            // 8. Process RESTful business failures
+            return switch (result.getErrorType()) {
+                case DUPLICATE_EMAIL -> ResponseEntity.status(HttpStatus.CONFLICT)
+                    .body(createErrorRepresentation("Customer with this email already exists", "RESOURCE_CONFLICT"));
+                case INVALID_BUSINESS_RULE -> ResponseEntity.status(HttpStatus.UNPROCESSABLE_ENTITY)
+                    .body(createErrorRepresentation(result.getErrorMessage(), "BUSINESS_RULE_VIOLATION"));
+                default -> ResponseEntity.status(HttpStatus.BAD_REQUEST)
+                    .body(createErrorRepresentation(result.getErrorMessage(), "INVALID_REQUEST"));
+            };
+            
+        } catch (Exception ex) {
+            // 6. Handle unhandled exceptions
+            throw ex; // Will be caught by global exception handler
+        }
+    }
+    
+    // GET /api/v1/customers/{id} - Retrieve customer resource
+    @GetMapping("/{id}")
+    public ResponseEntity<?> getCustomer(@PathVariable String id, HttpServletRequest request) {
+        
+        var authResult = authService.authenticate(request);
+        if (!authResult.isAuthenticated()) {
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
+                .body(createErrorRepresentation("Authentication required", "UNAUTHENTICATED"));
+        }
+        
+        if (!authService.isAuthorized(authResult.getUser(), "customers:read")) {
+            return ResponseEntity.status(HttpStatus.FORBIDDEN)
+                .body(createErrorRepresentation("Insufficient permissions", "FORBIDDEN"));
+        }
+        
+        var query = new GetCustomerQuery(id);
+        var result = customerService.getCustomer(query);
+        
+        if (result.isSuccess()) {
+            var customer = result.getValue();
+            var representation = mapper.toRepresentation(customer);
+            
+            // Add HATEOAS links
+            representation.addLink(linkBuilder.linkToSelf("customers", customer.getId()));
+            representation.addLink(linkBuilder.linkToEdit("customers", customer.getId()));
+            representation.addLink(linkBuilder.linkToDelete("customers", customer.getId()));
+            representation.addLink(linkBuilder.linkToCollection("customers"));
+            
+            return ResponseEntity.ok()
+                .contentType(MediaType.APPLICATION_JSON)
+                .eTag(customer.getVersion())
+                .lastModified(customer.getLastModified())
+                .body(representation);
+        }
+        
+        return ResponseEntity.status(HttpStatus.NOT_FOUND)
+            .body(createErrorRepresentation("Customer not found", "RESOURCE_NOT_FOUND"));
+    }
+    
+    // PUT /api/v1/customers/{id} - Update entire customer resource
+    @PutMapping("/{id}")
+    public ResponseEntity<?> updateCustomer(
+            @PathVariable String id,
+            @RequestBody @Valid CustomerRepresentation customerRep,
+            @RequestHeader(value = "If-Match", required = false) String ifMatch,
+            HttpServletRequest request) {
+        
+        var authResult = authService.authenticate(request);
+        if (!authResult.isAuthenticated()) {
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
+                .body(createErrorRepresentation("Authentication required", "UNAUTHENTICATED"));
+        }
+        
+        if (!authService.isAuthorized(authResult.getUser(), "customers:update")) {
+            return ResponseEntity.status(HttpStatus.FORBIDDEN)
+                .body(createErrorRepresentation("Insufficient permissions", "FORBIDDEN"));
+        }
+        
+        // Handle conditional requests
+        if (ifMatch != null) {
+            var currentCustomer = customerService.getCustomer(new GetCustomerQuery(id));
+            if (currentCustomer.isSuccess() && !currentCustomer.getValue().getVersion().equals(ifMatch)) {
+                return ResponseEntity.status(HttpStatus.PRECONDITION_FAILED)
+                    .body(createErrorRepresentation("Resource has been modified", "PRECONDITION_FAILED"));
+            }
+        }
+        
+        var validationResult = validationService.validate(customerRep);
+        if (!validationResult.isValid()) {
+            var errorRep = createValidationErrorRepresentation(validationResult.getErrors());
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(errorRep);
+        }
+        
+        var updateCommand = mapper.toUpdateCommand(id, customerRep);
+        var result = customerService.updateCustomer(updateCommand);
+        
+        if (result.isSuccess()) {
+            var customer = result.getValue();
+            var representation = mapper.toRepresentation(customer);
+            representation.addLink(linkBuilder.linkToSelf("customers", customer.getId()));
+            
+            return ResponseEntity.ok()
+                .contentType(MediaType.APPLICATION_JSON)
+                .eTag(customer.getVersion())
+                .body(representation);
+        }
+        
+        return switch (result.getErrorType()) {
+            case NOT_FOUND -> ResponseEntity.status(HttpStatus.NOT_FOUND)
+                .body(createErrorRepresentation("Customer not found", "RESOURCE_NOT_FOUND"));
+            case CONCURRENT_MODIFICATION -> ResponseEntity.status(HttpStatus.CONFLICT)
+                .body(createErrorRepresentation("Concurrent modification detected", "CONCURRENT_MODIFICATION"));
+            default -> ResponseEntity.status(HttpStatus.UNPROCESSABLE_ENTITY)
+                .body(createErrorRepresentation(result.getErrorMessage(), "BUSINESS_RULE_VIOLATION"));
+        };
+    }
+    
+    // DELETE /api/v1/customers/{id} - Delete customer resource
+    @DeleteMapping("/{id}")
+    public ResponseEntity<?> deleteCustomer(
+            @PathVariable String id,
+            @RequestHeader(value = "If-Match", required = false) String ifMatch,
+            HttpServletRequest request) {
+        
+        var authResult = authService.authenticate(request);
+        if (!authResult.isAuthenticated()) {
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
+                .body(createErrorRepresentation("Authentication required", "UNAUTHENTICATED"));
+        }
+        
+        if (!authService.isAuthorized(authResult.getUser(), "customers:delete")) {
+            return ResponseEntity.status(HttpStatus.FORBIDDEN)
+                .body(createErrorRepresentation("Insufficient permissions", "FORBIDDEN"));
+        }
+        
+        var deleteCommand = new DeleteCustomerCommand(id, ifMatch);
+        var result = customerService.deleteCustomer(deleteCommand);
+        
+        if (result.isSuccess()) {
+            return ResponseEntity.noContent().build();
+        }
+        
+        return switch (result.getErrorType()) {
+            case NOT_FOUND -> ResponseEntity.status(HttpStatus.NOT_FOUND)
+                .body(createErrorRepresentation("Customer not found", "RESOURCE_NOT_FOUND"));
+            case PRECONDITION_FAILED -> ResponseEntity.status(HttpStatus.PRECONDITION_FAILED)
+                .body(createErrorRepresentation("Resource has been modified", "PRECONDITION_FAILED"));
+            default -> ResponseEntity.status(HttpStatus.CONFLICT)
+                .body(createErrorRepresentation(result.getErrorMessage(), "RESOURCE_CONFLICT"));
+        };
+    }
+    
+    private ErrorRepresentation createErrorRepresentation(String message, String code) {
+        return new ErrorRepresentation(message, code, Instant.now());
+    }
+    
+    private ValidationErrorRepresentation createValidationErrorRepresentation(List<ValidationError> errors) {
+        return new ValidationErrorRepresentation("Validation failed", errors, Instant.now());
+    }
+}
+```
+
+```csharp C#
+[ApiController]
+[Route("api/v1/[controller]")]
+[Produces("application/json")]
+public class CustomersController : ControllerBase {
+    private readonly IAuthenticationService _authService;
+    private readonly IValidationService _validationService;
+    private readonly ICustomerService _customerService;
+    private readonly ICustomerMapper _mapper;
+    private readonly ILinkGenerator _linkGenerator;
+    
+    public CustomersController(
+        IAuthenticationService authService,
+        IValidationService validationService,
+        ICustomerService customerService,
+        ICustomerMapper mapper,
+        ILinkGenerator linkGenerator) {
+        _authService = authService;
+        _validationService = validationService;
+        _customerService = customerService;
+        _mapper = mapper;
+        _linkGenerator = linkGenerator;
+    }
+    
+    // POST /api/v1/customers - Create new customer resource
+    [HttpPost]
+    [ProducesResponseType(typeof(CustomerRepresentation), 201)]
+    [ProducesResponseType(typeof(ErrorRepresentation), 400)]
+    [ProducesResponseType(typeof(ErrorRepresentation), 401)]
+    [ProducesResponseType(typeof(ErrorRepresentation), 403)]
+    [ProducesResponseType(typeof(ErrorRepresentation), 409)]
+    public async Task<IActionResult> CreateCustomer([FromBody] CustomerRepresentation customerRep) {
+        
+        // 1. Authentication & Authorization
+        var authResult = await _authService.AuthenticateAsync(HttpContext);
+        if (!authResult.IsAuthenticated) {
+            return Unauthorized(new ErrorRepresentation("Authentication required", "UNAUTHENTICATED"));
+        }
+        
+        if (!await _authService.IsAuthorizedAsync(authResult.User, "customers:create")) {
+            return Forbid(new ErrorRepresentation("Insufficient permissions", "FORBIDDEN"));
+        }
+        
+        // 3. Validate REST representation
+        var validationResult = await _validationService.ValidateAsync(customerRep);
+        if (!validationResult.IsValid) {
+            var errorRep = new ValidationErrorRepresentation("Validation failed", validationResult.Errors);
+            return BadRequest(errorRep);
+        }
+        
+        // 4. Map REST representation to Application Core object
+        var createCommand = _mapper.ToCreateCommand(customerRep);
+        
+        try {
+            // 5. Invoke Application Core service
+            var result = await _customerService.CreateCustomerAsync(createCommand);
+            
+            // 7. Process successful resource creation
+            if (result.IsSuccess) {
+                var customer = result.Value;
+                var responseRep = _mapper.ToRepresentation(customer);
+                
+                // Add HATEOAS links
+                responseRep.Links.Add("self", _linkGenerator.GetUriByAction("GetCustomer", "Customers", new { id = customer.Id }));
+                responseRep.Links.Add("edit", _linkGenerator.GetUriByAction("UpdateCustomer", "Customers", new { id = customer.Id }));
+                responseRep.Links.Add("delete", _linkGenerator.GetUriByAction("DeleteCustomer", "Customers", new { id = customer.Id }));
+                responseRep.Links.Add("collection", _linkGenerator.GetUriByAction("GetCustomers", "Customers"));
+                
+                return CreatedAtAction(nameof(GetCustomer), new { id = customer.Id }, responseRep);
+            }
+            
+            // 8. Process RESTful business failures
+            return result.ErrorType switch {
+                CustomerErrorType.DuplicateEmail => Conflict(new ErrorRepresentation("Customer with this email already exists", "RESOURCE_CONFLICT")),
+                CustomerErrorType.InvalidBusinessRule => UnprocessableEntity(new ErrorRepresentation(result.ErrorMessage, "BUSINESS_RULE_VIOLATION")),
+                _ => BadRequest(new ErrorRepresentation(result.ErrorMessage, "INVALID_REQUEST"))
+            };
+            
+        } catch (Exception ex) {
+            // 6. Handle unhandled exceptions (will be caught by global middleware)
+            throw;
+        }
+    }
+    
+    // GET /api/v1/customers/{id} - Retrieve customer resource
+    [HttpGet("{id}")]
+    [ProducesResponseType(typeof(CustomerRepresentation), 200)]
+    [ProducesResponseType(typeof(ErrorRepresentation), 401)]
+    [ProducesResponseType(typeof(ErrorRepresentation), 403)]
+    [ProducesResponseType(typeof(ErrorRepresentation), 404)]
+    public async Task<IActionResult> GetCustomer(string id) {
+        
+        var authResult = await _authService.AuthenticateAsync(HttpContext);
+        if (!authResult.IsAuthenticated) {
+            return Unauthorized(new ErrorRepresentation("Authentication required", "UNAUTHENTICATED"));
+        }
+        
+        if (!await _authService.IsAuthorizedAsync(authResult.User, "customers:read")) {
+            return Forbid(new ErrorRepresentation("Insufficient permissions", "FORBIDDEN"));
+        }
+        
+        var query = new GetCustomerQuery(id);
+        var result = await _customerService.GetCustomerAsync(query);
+        
+        if (result.IsSuccess) {
+            var customer = result.Value;
+            var representation = _mapper.ToRepresentation(customer);
+            
+            // Add HATEOAS links
+            representation.Links.Add("self", _linkGenerator.GetUriByAction("GetCustomer", "Customers", new { id = customer.Id }));
+            representation.Links.Add("edit", _linkGenerator.GetUriByAction("UpdateCustomer", "Customers", new { id = customer.Id }));
+            representation.Links.Add("delete", _linkGenerator.GetUriByAction("DeleteCustomer", "Customers", new { id = customer.Id }));
+            representation.Links.Add("collection", _linkGenerator.GetUriByAction("GetCustomers", "Customers"));
+            
+            // Support conditional requests
+            Response.Headers.ETag = customer.Version;
+            Response.Headers.LastModified = customer.LastModified;
+            
+            return Ok(representation);
+        }
+        
+        return NotFound(new ErrorRepresentation("Customer not found", "RESOURCE_NOT_FOUND"));
+    }
+    
+    // PUT /api/v1/customers/{id} - Update entire customer resource
+    [HttpPut("{id}")]
+    [ProducesResponseType(typeof(CustomerRepresentation), 200)]
+    [ProducesResponseType(typeof(ErrorRepresentation), 400)]
+    [ProducesResponseType(typeof(ErrorRepresentation), 404)]
+    [ProducesResponseType(typeof(ErrorRepresentation), 409)]
+    [ProducesResponseType(typeof(ErrorRepresentation), 412)]
+    public async Task<IActionResult> UpdateCustomer(string id, [FromBody] CustomerRepresentation customerRep) {
+        
+        var authResult = await _authService.AuthenticateAsync(HttpContext);
+        if (!authResult.IsAuthenticated) {
+            return Unauthorized(new ErrorRepresentation("Authentication required", "UNAUTHENTICATED"));
+        }
+        
+        if (!await _authService.IsAuthorizedAsync(authResult.User, "customers:update")) {
+            return Forbid(new ErrorRepresentation("Insufficient permissions", "FORBIDDEN"));
+        }
+        
+        // Handle conditional requests
+        var ifMatch = Request.Headers["If-Match"].ToString();
+        if (!string.IsNullOrEmpty(ifMatch)) {
+            var currentCustomer = await _customerService.GetCustomerAsync(new GetCustomerQuery(id));
+            if (currentCustomer.IsSuccess && currentCustomer.Value.Version != ifMatch) {
+                return StatusCode(412, new ErrorRepresentation("Resource has been modified", "PRECONDITION_FAILED"));
+            }
+        }
+        
+        var validationResult = await _validationService.ValidateAsync(customerRep);
+        if (!validationResult.IsValid) {
+            var errorRep = new ValidationErrorRepresentation("Validation failed", validationResult.Errors);
+            return BadRequest(errorRep);
+        }
+        
+        var updateCommand = _mapper.ToUpdateCommand(id, customerRep);
+        var result = await _customerService.UpdateCustomerAsync(updateCommand);
+        
+        if (result.IsSuccess) {
+            var customer = result.Value;
+            var representation = _mapper.ToRepresentation(customer);
+            representation.Links.Add("self", _linkGenerator.GetUriByAction("GetCustomer", "Customers", new { id = customer.Id }));
+            
+            Response.Headers.ETag = customer.Version;
+            return Ok(representation);
+        }
+        
+        return result.ErrorType switch {
+            CustomerErrorType.NotFound => NotFound(new ErrorRepresentation("Customer not found", "RESOURCE_NOT_FOUND")),
+            CustomerErrorType.ConcurrentModification => Conflict(new ErrorRepresentation("Concurrent modification detected", "CONCURRENT_MODIFICATION")),
+            _ => UnprocessableEntity(new ErrorRepresentation(result.ErrorMessage, "BUSINESS_RULE_VIOLATION"))
+        };
+    }
+    
+    // DELETE /api/v1/customers/{id} - Delete customer resource
+    [HttpDelete("{id}")]
+    [ProducesResponseType(204)]
+    [ProducesResponseType(typeof(ErrorRepresentation), 404)]
+    [ProducesResponseType(typeof(ErrorRepresentation), 409)]
+    [ProducesResponseType(typeof(ErrorRepresentation), 412)]
+    public async Task<IActionResult> DeleteCustomer(string id) {
+        
+        var authResult = await _authService.AuthenticateAsync(HttpContext);
+        if (!authResult.IsAuthenticated) {
+            return Unauthorized(new ErrorRepresentation("Authentication required", "UNAUTHENTICATED"));
+        }
+        
+        if (!await _authService.IsAuthorizedAsync(authResult.User, "customers:delete")) {
+            return Forbid(new ErrorRepresentation("Insufficient permissions", "FORBIDDEN"));
+        }
+        
+        var ifMatch = Request.Headers["If-Match"].ToString();
+        var deleteCommand = new DeleteCustomerCommand(id, ifMatch);
+        var result = await _customerService.DeleteCustomerAsync(deleteCommand);
+        
+        if (result.IsSuccess) {
+            return NoContent();
+        }
+        
+        return result.ErrorType switch {
+            CustomerErrorType.NotFound => NotFound(new ErrorRepresentation("Customer not found", "RESOURCE_NOT_FOUND")),
+            CustomerErrorType.PreconditionFailed => StatusCode(412, new ErrorRepresentation("Resource has been modified", "PRECONDITION_FAILED")),
+            _ => Conflict(new ErrorRepresentation(result.ErrorMessage, "RESOURCE_CONFLICT"))
+        };
+    }
+}
+```
+
+```javascript JavaScript
+// Express.js RESTful API
+class CustomersRestController {
+    constructor(authService, validationService, customerService, mapper, linkBuilder) {
+        this.authService = authService;
+        this.validationService = validationService;
+        this.customerService = customerService;
+        this.mapper = mapper;
+        this.linkBuilder = linkBuilder;
+    }
+    
+    // POST /api/v1/customers - Create new customer resource
+    async createCustomer(req, res) {
+        try {
+            // 1. Authentication & Authorization
+            const authResult = await this.authService.authenticate(req);
+            if (!authResult.isAuthenticated) {
+                return res.status(401).json({
+                    error: "Authentication required",
+                    code: "UNAUTHENTICATED",
+                    timestamp: new Date().toISOString()
+                });
+            }
+            
+            if (!await this.authService.isAuthorized(authResult.user, 'customers:create')) {
+                return res.status(403).json({
+                    error: "Insufficient permissions",
+                    code: "FORBIDDEN",
+                    timestamp: new Date().toISOString()
+                });
+            }
+            
+            // 2. Receive REST representation
+            const customerRep = req.body;
+            
+            // 3. Validate REST representation
+            const validationResult = await this.validationService.validate(customerRep);
+            if (!validationResult.isValid) {
+                return res.status(400).json({
+                    error: "Validation failed",
+                    code: "VALIDATION_ERROR",
+                    details: validationResult.errors.reduce((acc, error) => {
+                        acc[error.field] = error.message;
+                        return acc;
+                    }, {}),
+                    timestamp: new Date().toISOString()
+                });
+            }
+            
+            // 4. Map REST representation to Application Core object
+            const createCommand = this.mapper.toCreateCommand(customerRep);
+            
+            // 5. Invoke Application Core service
+            const result = await this.customerService.createCustomer(createCommand);
+            
+            // 7. Process successful resource creation
+            if (result.isSuccess) {
+                const customer = result.value;
+                const responseRep = this.mapper.toRepresentation(customer);
+                
+                // Add HATEOAS links
+                responseRep._links = {
+                    self: { href: `/api/v1/customers/${customer.id}` },
+                    edit: { href: `/api/v1/customers/${customer.id}` },
+                    delete: { href: `/api/v1/customers/${customer.id}` },
+                    collection: { href: '/api/v1/customers' }
+                };
+                
+                return res.status(201)
+                    .location(`/api/v1/customers/${customer.id}`)
+                    .json(responseRep);
+            }
+            
+            // 8. Process RESTful business failures
+            switch (result.errorType) {
+                case 'DUPLICATE_EMAIL':
+                    return res.status(409).json({
+                        error: "Customer with this email already exists",
+                        code: "RESOURCE_CONFLICT",
+                        timestamp: new Date().toISOString()
+                    });
+                case 'INVALID_BUSINESS_RULE':
+                    return res.status(422).json({
+                        error: result.errorMessage,
+                        code: "BUSINESS_RULE_VIOLATION",
+                        timestamp: new Date().toISOString()
+                    });
+                default:
+                    return res.status(400).json({
+                        error: result.errorMessage,
+                        code: "INVALID_REQUEST",
+                        timestamp: new Date().toISOString()
+                    });
+            }
+            
+        } catch (error) {
+            // 6. Handle unhandled exceptions
+            throw error; // Will be caught by error middleware
+        }
+    }
+    
+    // GET /api/v1/customers/:id - Retrieve customer resource
+    async getCustomer(req, res) {
+        const authResult = await this.authService.authenticate(req);
+        if (!authResult.isAuthenticated) {
+            return res.status(401).json({
+                error: "Authentication required",
+                code: "UNAUTHENTICATED"
+            });
+        }
+        
+        if (!await this.authService.isAuthorized(authResult.user, 'customers:read')) {
+            return res.status(403).json({
+                error: "Insufficient permissions",
+                code: "FORBIDDEN"
+            });
+        }
+        
+        const { id } = req.params;
+        const query = { id };
+        const result = await this.customerService.getCustomer(query);
+        
+        if (result.isSuccess) {
+            const customer = result.value;
+            const representation = this.mapper.toRepresentation(customer);
+            
+            // Add HATEOAS links
+            representation._links = {
+                self: { href: `/api/v1/customers/${customer.id}` },
+                edit: { href: `/api/v1/customers/${customer.id}` },
+                delete: { href: `/api/v1/customers/${customer.id}` },
+                collection: { href: '/api/v1/customers' }
+            };
+            
+            return res.status(200)
+                .etag(customer.version)
+                .set('Last-Modified', customer.lastModified.toUTCString())
+                .json(representation);
+        }
+        
+        return res.status(404).json({
+            error: "Customer not found",
+            code: "RESOURCE_NOT_FOUND",
+            timestamp: new Date().toISOString()
+        });
+    }
+    
+    // PUT /api/v1/customers/:id - Update entire customer resource
+    async updateCustomer(req, res) {
+        const authResult = await this.authService.authenticate(req);
+        if (!authResult.isAuthenticated) {
+            return res.status(401).json({
+                error: "Authentication required",
+                code: "UNAUTHENTICATED"
+            });
+        }
+        
+        if (!await this.authService.isAuthorized(authResult.user, 'customers:update')) {
+            return res.status(403).json({
+                error: "Insufficient permissions",
+                code: "FORBIDDEN"
+            });
+        }
+        
+        const { id } = req.params;
+        const ifMatch = req.headers['if-match'];
+        
+        // Handle conditional requests
+        if (ifMatch) {
+            const currentCustomer = await this.customerService.getCustomer({ id });
+            if (currentCustomer.isSuccess && currentCustomer.value.version !== ifMatch) {
+                return res.status(412).json({
+                    error: "Resource has been modified",
+                    code: "PRECONDITION_FAILED"
+                });
+            }
+        }
+        
+        const customerRep = req.body;
+        const validationResult = await this.validationService.validate(customerRep);
+        if (!validationResult.isValid) {
+            return res.status(400).json({
+                error: "Validation failed",
+                code: "VALIDATION_ERROR",
+                details: validationResult.errors
+            });
+        }
+        
+        const updateCommand = this.mapper.toUpdateCommand(id, customerRep);
+        const result = await this.customerService.updateCustomer(updateCommand);
+        
+        if (result.isSuccess) {
+            const customer = result.value;
+            const representation = this.mapper.toRepresentation(customer);
+            representation._links = {
+                self: { href: `/api/v1/customers/${customer.id}` }
+            };
+            
+            return res.status(200)
+                .etag(customer.version)
+                .json(representation);
+        }
+        
+        switch (result.errorType) {
+            case 'NOT_FOUND':
+                return res.status(404).json({
+                    error: "Customer not found",
+                    code: "RESOURCE_NOT_FOUND"
+                });
+            case 'CONCURRENT_MODIFICATION':
+                return res.status(409).json({
+                    error: "Concurrent modification detected",
+                    code: "CONCURRENT_MODIFICATION"
+                });
+            default:
+                return res.status(422).json({
+                    error: result.errorMessage,
+                    code: "BUSINESS_RULE_VIOLATION"
+                });
+        }
+    }
+    
+    // DELETE /api/v1/customers/:id - Delete customer resource
+    async deleteCustomer(req, res) {
+        const authResult = await this.authService.authenticate(req);
+        if (!authResult.isAuthenticated) {
+            return res.status(401).json({
+                error: "Authentication required",
+                code: "UNAUTHENTICATED"
+            });
+        }
+        
+        if (!await this.authService.isAuthorized(authResult.user, 'customers:delete')) {
+            return res.status(403).json({
+                error: "Insufficient permissions",
+                code: "FORBIDDEN"
+            });
+        }
+        
+        const { id } = req.params;
+        const ifMatch = req.headers['if-match'];
+        const deleteCommand = { id, version: ifMatch };
+        const result = await this.customerService.deleteCustomer(deleteCommand);
+        
+        if (result.isSuccess) {
+            return res.status(204).send();
+        }
+        
+        switch (result.errorType) {
+            case 'NOT_FOUND':
+                return res.status(404).json({
+                    error: "Customer not found",
+                    code: "RESOURCE_NOT_FOUND"
+                });
+            case 'PRECONDITION_FAILED':
+                return res.status(412).json({
+                    error: "Resource has been modified",
+                    code: "PRECONDITION_FAILED"
+                });
+            default:
+                return res.status(409).json({
+                    error: result.errorMessage,
+                    code: "RESOURCE_CONFLICT"
+                });
+        }
+    }
+}
+
+// Router setup
+const router = express.Router();
+const controller = new CustomersRestController(authService, validationService, customerService, mapper, linkBuilder);
+
+router.post('/customers', (req, res) => controller.createCustomer(req, res));
+router.get('/customers/:id', (req, res) => controller.getCustomer(req, res));
+router.put('/customers/:id', (req, res) => controller.updateCustomer(req, res));
+router.delete('/customers/:id', (req, res) => controller.deleteCustomer(req, res));
+```
+
+```typescript TypeScript
+// NestJS RESTful Controller
+@Controller('api/v1/customers')
+@ApiTags('customers')
+export class CustomersRestController {
+    constructor(
+        private readonly authService: IAuthenticationService,
+        private readonly validationService: IValidationService,
+        private readonly customerService: ICustomerService,
+        private readonly mapper: ICustomerMapper,
+        private readonly linkBuilder: ILinkBuilder
+    ) {}
+    
+    // POST /api/v1/customers - Create new customer resource
+    @Post()
+    @ApiOperation({ summary: 'Create new customer resource' })
+    @ApiResponse({ status: 201, description: 'Customer created successfully', type: CustomerRepresentation })
+    @ApiResponse({ status: 400, description: 'Validation failed', type: ValidationErrorRepresentation })
+    @ApiResponse({ status: 401, description: 'Authentication required' })
+    @ApiResponse({ status: 403, description: 'Insufficient permissions' })
+    @ApiResponse({ status: 409, description: 'Resource conflict' })
+    async createCustomer(
+        @Body() customerRep: CustomerRepresentation,
+        @Req() req: Request,
+        @Res() res: Response
+    ): Promise<Response> {
+        
+        try {
+            // 1. Authentication & Authorization
+            const authResult = await this.authService.authenticate(req);
+            if (!authResult.isAuthenticated) {
+                return res.status(401).json({
+                    error: 'Authentication required',
+                    code: 'UNAUTHENTICATED',
+                    timestamp: new Date().toISOString()
+                });
+            }
+            
+            if (!await this.authService.isAuthorized(authResult.user, 'customers:create')) {
+                return res.status(403).json({
+                    error: 'Insufficient permissions',
+                    code: 'FORBIDDEN',
+                    timestamp: new Date().toISOString()
+                });
+            }
+            
+            // 3. Validate REST representation
+            const validationResult = await this.validationService.validate(customerRep);
+            if (!validationResult.isValid) {
+                const errorDetails = validationResult.errors.reduce((acc, error) => {
+                    acc[error.field] = error.message;
+                    return acc;
+                }, {} as Record<string, string>);
+                
+                return res.status(400).json({
+                    error: 'Validation failed',
+                    code: 'VALIDATION_ERROR',
+                    details: errorDetails,
+                    timestamp: new Date().toISOString()
+                });
+            }
+            
+            // 4. Map REST representation to Application Core object
+            const createCommand = this.mapper.toCreateCommand(customerRep);
+            
+            // 5. Invoke Application Core service
+            const result = await this.customerService.createCustomer(createCommand);
+            
+            // 7. Process successful resource creation
+            if (result.isSuccess) {
+                const customer = result.value;
+                const responseRep = this.mapper.toRepresentation(customer);
+                
+                // Add HATEOAS links
+                responseRep._links = {
+                    self: { href: `/api/v1/customers/${customer.id}` },
+                    edit: { href: `/api/v1/customers/${customer.id}` },
+                    delete: { href: `/api/v1/customers/${customer.id}` },
+                    collection: { href: '/api/v1/customers' }
+                };
+                
+                return res.status(201)
+                    .location(`/api/v1/customers/${customer.id}`)
+                    .json(responseRep);
+            }
+            
+            // 8. Process RESTful business failures
+            switch (result.errorType) {
+                case CustomerErrorType.DuplicateEmail:
+                    return res.status(409).json({
+                        error: 'Customer with this email already exists',
+                        code: 'RESOURCE_CONFLICT',
+                        timestamp: new Date().toISOString()
+                    });
+                case CustomerErrorType.InvalidBusinessRule:
+                    return res.status(422).json({
+                        error: result.errorMessage,
+                        code: 'BUSINESS_RULE_VIOLATION',
+                        timestamp: new Date().toISOString()
+                    });
+                default:
+                    return res.status(400).json({
+                        error: result.errorMessage,
+                        code: 'INVALID_REQUEST',
+                        timestamp: new Date().toISOString()
+                    });
+            }
+            
+        } catch (error) {
+            // 6. Handle unhandled exceptions
+            throw error; // Will be caught by exception filter
+        }
+    }
+    
+    // GET /api/v1/customers/:id - Retrieve customer resource
+    @Get(':id')
+    @ApiOperation({ summary: 'Retrieve customer resource' })
+    @ApiResponse({ status: 200, description: 'Customer found', type: CustomerRepresentation })
+    @ApiResponse({ status: 401, description: 'Authentication required' })
+    @ApiResponse({ status: 403, description: 'Insufficient permissions' })
+    @ApiResponse({ status: 404, description: 'Customer not found' })
+    async getCustomer(
+        @Param('id') id: string,
+        @Req() req: Request,
+        @Res() res: Response
+    ): Promise<Response> {
+        
+        const authResult = await this.authService.authenticate(req);
+        if (!authResult.isAuthenticated) {
+            return res.status(401).json({
+                error: 'Authentication required',
+                code: 'UNAUTHENTICATED'
+            });
+        }
+        
+        if (!await this.authService.isAuthorized(authResult.user, 'customers:read')) {
+            return res.status(403).json({
+                error: 'Insufficient permissions',
+                code: 'FORBIDDEN'
+            });
+        }
+        
+        const query = new GetCustomerQuery(id);
+        const result = await this.customerService.getCustomer(query);
+        
+        if (result.isSuccess) {
+            const customer = result.value;
+            const representation = this.mapper.toRepresentation(customer);
+            
+            // Add HATEOAS links
+            representation._links = {
+                self: { href: `/api/v1/customers/${customer.id}` },
+                edit: { href: `/api/v1/customers/${customer.id}` },
+                delete: { href: `/api/v1/customers/${customer.id}` },
+                collection: { href: '/api/v1/customers' }
+            };
+            
+            return res.status(200)
+                .set('ETag', customer.version)
+                .set('Last-Modified', customer.lastModified.toUTCString())
+                .json(representation);
+        }
+        
+        return res.status(404).json({
+            error: 'Customer not found',
+            code: 'RESOURCE_NOT_FOUND',
+            timestamp: new Date().toISOString()
+        });
+    }
+    
+    // Additional methods for PUT and DELETE would follow similar patterns...
+}
+
+// Representation classes
+export class CustomerRepresentation {
+    id?: string;
+    email: string;
+    name: string;
+    type: CustomerType;
+    version?: string;
+    createdAt?: Date;
+    lastModified?: Date;
+    _links?: Record<string, { href: string }>;
+}
+
+export class ErrorRepresentation {
+    constructor(
+        public error: string,
+        public code: string,
+        public timestamp: string = new Date().toISOString()
+    ) {}
+}
+
+export class ValidationErrorRepresentation extends ErrorRepresentation {
+    constructor(
+        error: string,
+        public details: Record<string, string>
+    ) {
+        super(error, 'VALIDATION_ERROR');
+    }
+}
+```
+</CodeGroup>
+
+## REST Specific Considerations
+
+### **Resource-Based URLs**
+- **Collection resources**: `/api/v1/customers`
+- **Item resources**: `/api/v1/customers/{id}`
+- **Sub-resources**: `/api/v1/customers/{id}/orders`
+- **Versioning**: Include API version in URL path
+
+### **HTTP Verb Usage**
+- **GET**: Retrieve resources (safe, idempotent)
+- **POST**: Create new resources (unsafe, non-idempotent)
+- **PUT**: Update entire resources (unsafe, idempotent)
+- **PATCH**: Partial resource updates (unsafe, non-idempotent)
+- **DELETE**: Remove resources (unsafe, idempotent)
+
+### **HATEOAS (Hypermedia as the Engine of Application State)**
+```json
+{
+  "id": "123",
+  "email": "customer@example.com",
+  "name": "John Doe",
+  "_links": {
+    "self": { "href": "/api/v1/customers/123" },
+    "edit": { "href": "/api/v1/customers/123" },
+    "delete": { "href": "/api/v1/customers/123" },
+    "orders": { "href": "/api/v1/customers/123/orders" },
+    "collection": { "href": "/api/v1/customers" }
+  }
+}
+```
+
+### **Conditional Requests**
+- **ETag**: Entity tags for cache validation and optimistic concurrency
+- **If-Match**: Conditional updates based on resource version
+- **If-None-Match**: Conditional creation to prevent duplicates
+- **Last-Modified**: Timestamp-based conditional requests
+
+### **Content Negotiation**
+- **Accept**: Client specifies preferred response format (application/json, application/hal+json)
+- **Content-Type**: Server indicates response format
+- **Accept-Language**: Localization support
+- **Accept-Encoding**: Compression preferences
+
+### **RESTful Error Responses**
+```json
+{
+  "error": "Validation failed",
+  "code": "VALIDATION_ERROR",
+  "details": {
+    "email": "Email address is required",
+    "name": "Name cannot be empty"
+  },
+  "timestamp": "2023-10-02T10:30:00Z",
+  "_links": {
+    "about": { "href": "/api/v1/errors/validation" }
+  }
+}
+```

@@ -1,0 +1,524 @@
+---
+title: "MCP Input Port Flow"
+description: "Implementation pattern for Model Context Protocol (MCP) input ports with protocol-specific guidance and code examples."
+---
+
+# MCP Input Port Flow
+
+This document shows how to implement the universal input port flow pattern specifically for Model Context Protocol (MCP) tools and resources, including appropriate response formats and MCP conventions.
+
+## MCP Specific Flow
+
+1. **Authenticate and authorize** the request using MCP session context and capabilities. Return MCP error responses for authentication/authorization failures.
+
+2. **Receive inbound MCP request** with structured JSON-RPC 2.0 messages via tool calls or resource requests.
+
+3. **Validate request parameters** against MCP schema and business rules. Return structured error responses with validation details.
+
+4. **Map MCP parameters** to Application Core command/query objects using dedicated mappers.
+
+5. **Invoke Application Core service** with mapped objects to execute business logic.
+
+6. **Handle system exceptions** with MCP error responses. Return appropriate error codes and sanitized messages.
+
+7. **Process successful business operations**:
+   - Return structured MCP tool results or resource content
+   - Include appropriate metadata and content types
+   - Support streaming responses where applicable
+
+8. **Process business logic failures**:
+   - Return MCP error responses with appropriate error codes
+   - Include structured error details in the response
+   - Maintain MCP protocol compliance
+
+## Implementation Example
+
+<CodeGroup>
+```java Java
+// Using MCP Java SDK
+@McpTool("create_customer")
+public class CreateCustomerTool {
+    private final IAuthenticationService authService;
+    private final IValidationService validationService;
+    private final ICustomerService customerService;
+    private final ICustomerMapper mapper;
+    
+    public CreateCustomerTool(IAuthenticationService authService,
+                             IValidationService validationService,
+                             ICustomerService customerService,
+                             ICustomerMapper mapper) {
+        this.authService = authService;
+        this.validationService = validationService;
+        this.customerService = customerService;
+        this.mapper = mapper;
+    }
+    
+    @McpToolDescription("Creates a new customer in the system")
+    public McpToolResult execute(McpToolRequest request) {
+        try {
+            // 1. Authentication & Authorization
+            var session = request.getSession();
+            var authResult = authService.authenticate(session);
+            if (!authResult.isAuthenticated()) {
+                return McpToolResult.error("Authentication failed", "UNAUTHENTICATED");
+            }
+            
+            if (!authService.isAuthorized(authResult.getUser(), "customer:create")) {
+                return McpToolResult.error("Insufficient permissions", "FORBIDDEN");
+            }
+            
+            // 2. Receive MCP parameters
+            var parameters = request.getParameters();
+            var email = parameters.getString("email");
+            var name = parameters.getString("name");
+            var customerType = parameters.getString("type");
+            
+            // 3. Input Validation
+            var createRequest = new CreateCustomerRequest(email, name, customerType);
+            var validationResult = validationService.validate(createRequest);
+            if (!validationResult.isValid()) {
+                var errorDetails = validationResult.getErrors().stream()
+                    .collect(Collectors.toMap(
+                        ValidationError::getField,
+                        ValidationError::getMessage));
+                
+                return McpToolResult.error("Validation failed", "INVALID_PARAMS")
+                    .withDetails(errorDetails);
+            }
+            
+            // 4. Map MCP parameters to Application Core object
+            var customerCommand = mapper.toCreateCommand(createRequest);
+            
+            // 5. Invoke Application Core service
+            var result = customerService.createCustomer(customerCommand);
+            
+            // 7. Process successful response
+            if (result.isSuccess()) {
+                var customer = result.getValue();
+                var responseData = Map.of(
+                    "id", customer.getId(),
+                    "email", customer.getEmail(),
+                    "name", customer.getName(),
+                    "type", customer.getType().toString(),
+                    "createdAt", customer.getCreatedAt().toString()
+                );
+                
+                return McpToolResult.success("Customer created successfully")
+                    .withContent(McpContent.text(JsonUtils.toJson(responseData)))
+                    .withMimeType("application/json");
+            }
+            
+            // 8. Process business logic failures
+            var errorCode = switch (result.getErrorType()) {
+                case DUPLICATE_EMAIL -> "RESOURCE_CONFLICT";
+                case INVALID_BUSINESS_RULE -> "BUSINESS_RULE_VIOLATION";
+                case NOT_FOUND -> "RESOURCE_NOT_FOUND";
+                default -> "INVALID_PARAMS";
+            };
+            
+            return McpToolResult.error(result.getErrorMessage(), errorCode)
+                .withDetails(Map.of("errorType", result.getErrorType().toString()));
+            
+        } catch (Exception ex) {
+            // 6. Handle unhandled exceptions
+            return McpToolResult.error("An internal error occurred", "INTERNAL_ERROR");
+        }
+    }
+}
+```
+
+```csharp C#
+// Using MCP .NET SDK
+[McpTool("create_customer", "Creates a new customer in the system")]
+public class CreateCustomerTool : IMcpTool {
+    private readonly IAuthenticationService _authService;
+    private readonly IValidationService _validationService;
+    private readonly ICustomerService _customerService;
+    private readonly ICustomerMapper _mapper;
+    
+    public CreateCustomerTool(
+        IAuthenticationService authService,
+        IValidationService validationService,
+        ICustomerService customerService,
+        ICustomerMapper mapper) {
+        _authService = authService;
+        _validationService = validationService;
+        _customerService = customerService;
+        _mapper = mapper;
+    }
+    
+    public async Task<McpToolResult> ExecuteAsync(McpToolRequest request) {
+        try {
+            // 1. Authentication & Authorization
+            var session = request.Session;
+            var authResult = await _authService.AuthenticateAsync(session);
+            if (!authResult.IsAuthenticated) {
+                return McpToolResult.Error("Authentication failed", "UNAUTHENTICATED");
+            }
+            
+            if (!await _authService.IsAuthorizedAsync(authResult.User, "customer:create")) {
+                return McpToolResult.Error("Insufficient permissions", "FORBIDDEN");
+            }
+            
+            // 2. Receive MCP parameters
+            var parameters = request.Parameters;
+            var email = parameters.GetString("email");
+            var name = parameters.GetString("name");
+            var customerType = parameters.GetString("type");
+            
+            // 3. Input Validation
+            var createRequest = new CreateCustomerRequest(email, name, customerType);
+            var validationResult = await _validationService.ValidateAsync(createRequest);
+            if (!validationResult.IsValid) {
+                var errorDetails = validationResult.Errors.ToDictionary(
+                    error => error.Field,
+                    error => error.Message);
+                
+                return McpToolResult.Error("Validation failed", "INVALID_PARAMS")
+                    .WithDetails(errorDetails);
+            }
+            
+            // 4. Map MCP parameters to Application Core object
+            var customerCommand = _mapper.ToCreateCommand(createRequest);
+            
+            // 5. Invoke Application Core service
+            var result = await _customerService.CreateCustomerAsync(customerCommand);
+            
+            // 7. Process successful response
+            if (result.IsSuccess) {
+                var customer = result.Value;
+                var responseData = new {
+                    id = customer.Id,
+                    email = customer.Email,
+                    name = customer.Name,
+                    type = customer.Type.ToString(),
+                    createdAt = customer.CreatedAt.ToString("O")
+                };
+                
+                return McpToolResult.Success("Customer created successfully")
+                    .WithContent(McpContent.Text(JsonSerializer.Serialize(responseData)))
+                    .WithMimeType("application/json");
+            }
+            
+            // 8. Process business logic failures
+            var errorCode = result.ErrorType switch {
+                CustomerErrorType.DuplicateEmail => "RESOURCE_CONFLICT",
+                CustomerErrorType.InvalidBusinessRule => "BUSINESS_RULE_VIOLATION",
+                CustomerErrorType.NotFound => "RESOURCE_NOT_FOUND",
+                _ => "INVALID_PARAMS"
+            };
+            
+            return McpToolResult.Error(result.ErrorMessage, errorCode)
+                .WithDetails(new Dictionary<string, object> {
+                    ["errorType"] = result.ErrorType.ToString()
+                });
+            
+        } catch (Exception ex) {
+            // 6. Handle unhandled exceptions
+            return McpToolResult.Error("An internal error occurred", "INTERNAL_ERROR");
+        }
+    }
+}
+```
+
+```javascript JavaScript
+// Using MCP Node.js SDK
+class CreateCustomerTool {
+    constructor(authService, validationService, customerService, mapper) {
+        this.authService = authService;
+        this.validationService = validationService;
+        this.customerService = customerService;
+        this.mapper = mapper;
+    }
+    
+    async execute(request) {
+        try {
+            // 1. Authentication & Authorization
+            const session = request.session;
+            const authResult = await this.authService.authenticate(session);
+            if (!authResult.isAuthenticated) {
+                return {
+                    isError: true,
+                    content: [{
+                        type: 'text',
+                        text: 'Authentication failed'
+                    }],
+                    errorCode: 'UNAUTHENTICATED'
+                };
+            }
+            
+            if (!await this.authService.isAuthorized(authResult.user, 'customer:create')) {
+                return {
+                    isError: true,
+                    content: [{
+                        type: 'text',
+                        text: 'Insufficient permissions'
+                    }],
+                    errorCode: 'FORBIDDEN'
+                };
+            }
+            
+            // 2. Receive MCP parameters
+            const { email, name, type } = request.params;
+            
+            // 3. Input Validation
+            const validationResult = await this.validationService.validate({
+                email, name, type
+            });
+            if (!validationResult.isValid) {
+                const errorDetails = validationResult.errors.reduce((acc, error) => {
+                    acc[error.field] = error.message;
+                    return acc;
+                }, {});
+                
+                return {
+                    isError: true,
+                    content: [{
+                        type: 'text',
+                        text: 'Validation failed'
+                    }],
+                    errorCode: 'INVALID_PARAMS',
+                    details: errorDetails
+                };
+            }
+            
+            // 4. Map MCP parameters to Application Core object
+            const customerCommand = this.mapper.toCreateCommand({ email, name, type });
+            
+            // 5. Invoke Application Core service
+            const result = await this.customerService.createCustomer(customerCommand);
+            
+            // 7. Process successful response
+            if (result.isSuccess) {
+                const customer = result.value;
+                const responseData = {
+                    id: customer.id,
+                    email: customer.email,
+                    name: customer.name,
+                    type: customer.type,
+                    createdAt: customer.createdAt.toISOString()
+                };
+                
+                return {
+                    content: [{
+                        type: 'text',
+                        text: JSON.stringify(responseData, null, 2),
+                        mimeType: 'application/json'
+                    }]
+                };
+            }
+            
+            // 8. Process business logic failures
+            let errorCode;
+            switch (result.errorType) {
+                case 'DUPLICATE_EMAIL':
+                    errorCode = 'RESOURCE_CONFLICT';
+                    break;
+                case 'INVALID_BUSINESS_RULE':
+                    errorCode = 'BUSINESS_RULE_VIOLATION';
+                    break;
+                case 'NOT_FOUND':
+                    errorCode = 'RESOURCE_NOT_FOUND';
+                    break;
+                default:
+                    errorCode = 'INVALID_PARAMS';
+            }
+            
+            return {
+                isError: true,
+                content: [{
+                    type: 'text',
+                    text: result.errorMessage
+                }],
+                errorCode,
+                details: { errorType: result.errorType }
+            };
+            
+        } catch (error) {
+            // 6. Handle unhandled exceptions
+            console.error('Unhandled exception in MCP tool:', error);
+            return {
+                isError: true,
+                content: [{
+                    type: 'text',
+                    text: 'An internal error occurred'
+                }],
+                errorCode: 'INTERNAL_ERROR'
+            };
+        }
+    }
+}
+
+// Tool registration
+const server = new McpServer();
+server.addTool('create_customer', 'Creates a new customer in the system', 
+    new CreateCustomerTool(authService, validationService, customerService, mapper)
+);
+```
+
+```typescript TypeScript
+// Using MCP TypeScript SDK
+@McpTool('create_customer')
+export class CreateCustomerTool implements IMcpTool {
+    constructor(
+        private readonly authService: IAuthenticationService,
+        private readonly validationService: IValidationService,
+        private readonly customerService: ICustomerService,
+        private readonly mapper: ICustomerMapper
+    ) {}
+    
+    get description(): string {
+        return 'Creates a new customer in the system';
+    }
+    
+    get parameters(): McpToolParameters {
+        return {
+            type: 'object',
+            properties: {
+                email: { type: 'string', description: 'Customer email address' },
+                name: { type: 'string', description: 'Customer full name' },
+                type: { type: 'string', enum: ['INDIVIDUAL', 'BUSINESS'], description: 'Customer type' }
+            },
+            required: ['email', 'name', 'type']
+        };
+    }
+    
+    async execute(request: McpToolRequest): Promise<McpToolResult> {
+        try {
+            // 1. Authentication & Authorization
+            const session = request.session;
+            const authResult = await this.authService.authenticate(session);
+            if (!authResult.isAuthenticated) {
+                return McpToolResult.error('Authentication failed', 'UNAUTHENTICATED');
+            }
+            
+            if (!await this.authService.isAuthorized(authResult.user, 'customer:create')) {
+                return McpToolResult.error('Insufficient permissions', 'FORBIDDEN');
+            }
+            
+            // 2. Receive MCP parameters
+            const { email, name, type } = request.params as CreateCustomerParams;
+            
+            // 3. Input Validation
+            const validationResult = await this.validationService.validate({
+                email, name, type
+            });
+            if (!validationResult.isValid) {
+                const errorDetails = validationResult.errors.reduce((acc, error) => {
+                    acc[error.field] = error.message;
+                    return acc;
+                }, {} as Record<string, string>);
+                
+                return McpToolResult.error('Validation failed', 'INVALID_PARAMS')
+                    .withDetails(errorDetails);
+            }
+            
+            // 4. Map MCP parameters to Application Core object
+            const customerCommand = this.mapper.toCreateCommand({ email, name, type });
+            
+            // 5. Invoke Application Core service
+            const result = await this.customerService.createCustomer(customerCommand);
+            
+            // 7. Process successful response
+            if (result.isSuccess) {
+                const customer = result.value;
+                const responseData = {
+                    id: customer.id,
+                    email: customer.email,
+                    name: customer.name,
+                    type: customer.type,
+                    createdAt: customer.createdAt.toISOString()
+                };
+                
+                return McpToolResult.success('Customer created successfully')
+                    .withContent(McpContent.text(JSON.stringify(responseData, null, 2)))
+                    .withMimeType('application/json');
+            }
+            
+            // 8. Process business logic failures
+            const errorCode = this.mapErrorTypeToMcpCode(result.errorType);
+            
+            return McpToolResult.error(result.errorMessage, errorCode)
+                .withDetails({ errorType: result.errorType });
+            
+        } catch (error) {
+            // 6. Handle unhandled exceptions
+            console.error('Unhandled exception in MCP tool:', error);
+            return McpToolResult.error('An internal error occurred', 'INTERNAL_ERROR');
+        }
+    }
+    
+    private mapErrorTypeToMcpCode(errorType: CustomerErrorType): string {
+        switch (errorType) {
+            case CustomerErrorType.DuplicateEmail:
+                return 'RESOURCE_CONFLICT';
+            case CustomerErrorType.InvalidBusinessRule:
+                return 'BUSINESS_RULE_VIOLATION';
+            case CustomerErrorType.NotFound:
+                return 'RESOURCE_NOT_FOUND';
+            default:
+                return 'INVALID_PARAMS';
+        }
+    }
+}
+
+interface CreateCustomerParams {
+    email: string;
+    name: string;
+    type: 'INDIVIDUAL' | 'BUSINESS';
+}
+```
+</CodeGroup>
+
+## MCP Specific Considerations
+
+### **Error Code Guidelines**
+- **UNAUTHENTICATED**: Authentication failures
+- **FORBIDDEN**: Authorization failures
+- **INVALID_PARAMS**: Validation failures, malformed parameters
+- **RESOURCE_CONFLICT**: Business conflicts (duplicate resources)
+- **BUSINESS_RULE_VIOLATION**: Business rule violations
+- **RESOURCE_NOT_FOUND**: Resource doesn't exist
+- **INTERNAL_ERROR**: System errors, unhandled exceptions
+
+### **Tool Response Format**
+```json
+{
+  "content": [
+    {
+      "type": "text",
+      "text": "{\"id\": \"123\", \"email\": \"user@example.com\"}",
+      "mimeType": "application/json"
+    }
+  ]
+}
+```
+
+### **Error Response Format**
+```json
+{
+  "isError": true,
+  "content": [
+    {
+      "type": "text",
+      "text": "Validation failed"
+    }
+  ],
+  "errorCode": "INVALID_PARAMS",
+  "details": {
+    "email": "Email address is required",
+    "name": "Name cannot be empty"
+  }
+}
+```
+
+### **Tool Definition**
+- **Schema-based**: Define parameter schemas using JSON Schema
+- **Descriptive**: Provide clear descriptions for tools and parameters
+- **Type-safe**: Leverage TypeScript/C# types for parameter validation
+
+### **Protocol Features**
+- **Streaming**: Support progressive responses for long-running operations
+- **Resources**: Expose data resources alongside tools
+- **Capabilities**: Negotiate capabilities during session initialization
+- **Context**: Maintain conversation context across tool calls

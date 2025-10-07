@@ -1,0 +1,484 @@
+---
+title: "Ports & Adapters Architecture"
+description: "Understanding how ports & adapters (hexagonal), onion, and clean architecture patterns enable adaptability in microservices."
+---
+
+# Ports & Adapters Architecture
+
+The **Ports & Adapters** pattern (also known as **Hexagonal Architecture**) is fundamental to building adaptable microservices. Along with related patterns like **Onion Architecture** and **Clean Architecture**, it provides a structural foundation that enables applications to evolve and adapt to changing requirements without core logic modifications.
+
+## Core Concept
+
+The architecture creates clear boundaries between your application's **business logic** (the core) and **external concerns** (databases, APIs, messaging systems, user interfaces). This separation is achieved through:
+
+- **Ports**: Interfaces that define contracts for communication
+- **Adapters**: Concrete implementations that handle specific technologies
+
+## Architecture Layers
+
+### **Domain Core**
+- Pure business logic and domain models
+- No dependencies on external frameworks or technologies
+- Contains the essential business rules and entities
+
+### **Application Services**
+- Orchestrates domain operations
+- Defines ports (interfaces) for external dependencies
+- Implements use cases and workflows
+
+### **Adapters (Infrastructure)**
+- Implement the port interfaces
+- Handle technology-specific concerns
+- Bridge between the application and external systems
+
+## Adaptability Benefits
+
+### **1. Technology Independence**
+Your core business logic remains unchanged when switching technologies:
+
+<CodeGroup>
+```java Java
+// Port (interface) - defined in application layer
+public interface CustomerRepository {
+    Customer findById(Long id);
+    void save(Customer customer);
+    List<Customer> findByStatus(CustomerStatus status);
+}
+
+// Adapter 1 - PostgreSQL implementation
+@Repository
+public class PostgreSQLCustomerRepository implements CustomerRepository {
+    @Autowired
+    private JpaRepository<CustomerEntity, Long> jpaRepository;
+    
+    public Customer findById(Long id) {
+        return mapper.toDomain(jpaRepository.findById(id).orElse(null));
+    }
+    
+    public void save(Customer customer) {
+        jpaRepository.save(mapper.toEntity(customer));
+    }
+}
+
+// Adapter 2 - MongoDB implementation (easy to swap)
+@Repository
+public class MongoCustomerRepository implements CustomerRepository {
+    @Autowired
+    private MongoTemplate mongoTemplate;
+    
+    public Customer findById(Long id) {
+        CustomerDocument doc = mongoTemplate.findById(id, CustomerDocument.class);
+        return mapper.toDomain(doc);
+    }
+    
+    public void save(Customer customer) {
+        mongoTemplate.save(mapper.toDocument(customer));
+    }
+}
+```
+
+```csharp C#
+// Port (interface) - defined in application layer
+public interface ICustomerRepository {
+    Task<Customer> FindByIdAsync(long id);
+    Task SaveAsync(Customer customer);
+    Task<List<Customer>> FindByStatusAsync(CustomerStatus status);
+}
+
+// Adapter 1 - Entity Framework implementation
+public class EfCustomerRepository : ICustomerRepository {
+    private readonly ApplicationDbContext _context;
+    
+    public EfCustomerRepository(ApplicationDbContext context) {
+        _context = context;
+    }
+    
+    public async Task<Customer> FindByIdAsync(long id) {
+        var entity = await _context.Customers.FindAsync(id);
+        return _mapper.ToDomain(entity);
+    }
+    
+    public async Task SaveAsync(Customer customer) {
+        var entity = _mapper.ToEntity(customer);
+        _context.Customers.Update(entity);
+        await _context.SaveChangesAsync();
+    }
+}
+
+// Adapter 2 - Dapper implementation (easy to swap)
+public class DapperCustomerRepository : ICustomerRepository {
+    private readonly IDbConnection _connection;
+    
+    public DapperCustomerRepository(IDbConnection connection) {
+        _connection = connection;
+    }
+    
+    public async Task<Customer> FindByIdAsync(long id) {
+        var sql = "SELECT * FROM Customers WHERE Id = @Id";
+        var result = await _connection.QueryFirstOrDefaultAsync(sql, new { Id = id });
+        return _mapper.ToDomain(result);
+    }
+}
+```
+
+```javascript JavaScript
+// Port (interface) - defined in application layer
+class CustomerRepository {
+    async findById(id) {
+        throw new Error('Method must be implemented');
+    }
+    
+    async save(customer) {
+        throw new Error('Method must be implemented');
+    }
+    
+    async findByStatus(status) {
+        throw new Error('Method must be implemented');
+    }
+}
+
+// Adapter 1 - MongoDB implementation
+class MongoCustomerRepository extends CustomerRepository {
+    constructor(mongoClient) {
+        super();
+        this.collection = mongoClient.db('app').collection('customers');
+    }
+    
+    async findById(id) {
+        const doc = await this.collection.findOne({ _id: id });
+        return this.toDomain(doc);
+    }
+    
+    async save(customer) {
+        const doc = this.toDocument(customer);
+        await this.collection.replaceOne({ _id: customer.id }, doc, { upsert: true });
+    }
+}
+
+// Adapter 2 - PostgreSQL implementation (easy to swap)
+class PostgreSQLCustomerRepository extends CustomerRepository {
+    constructor(pgClient) {
+        super();
+        this.client = pgClient;
+    }
+    
+    async findById(id) {
+        const result = await this.client.query('SELECT * FROM customers WHERE id = $1', [id]);
+        return this.toDomain(result.rows[0]);
+    }
+    
+    async save(customer) {
+        const query = 'INSERT INTO customers (id, name, status) VALUES ($1, $2, $3) ON CONFLICT (id) DO UPDATE SET name = $2, status = $3';
+        await this.client.query(query, [customer.id, customer.name, customer.status]);
+    }
+}
+```
+
+```typescript TypeScript
+// Port (interface) - defined in application layer
+interface CustomerRepository {
+    findById(id: number): Promise<Customer | null>;
+    save(customer: Customer): Promise<void>;
+    findByStatus(status: CustomerStatus): Promise<Customer[]>;
+}
+
+// Adapter 1 - Prisma implementation
+class PrismaCustomerRepository implements CustomerRepository {
+    constructor(private prisma: PrismaClient) {}
+    
+    async findById(id: number): Promise<Customer | null> {
+        const customer = await this.prisma.customer.findUnique({ where: { id } });
+        return customer ? this.toDomain(customer) : null;
+    }
+    
+    async save(customer: Customer): Promise<void> {
+        await this.prisma.customer.upsert({
+            where: { id: customer.id },
+            create: this.toCreateInput(customer),
+            update: this.toUpdateInput(customer)
+        });
+    }
+}
+
+// Adapter 2 - TypeORM implementation (easy to swap)
+class TypeOrmCustomerRepository implements CustomerRepository {
+    constructor(private repository: Repository<CustomerEntity>) {}
+    
+    async findById(id: number): Promise<Customer | null> {
+        const entity = await this.repository.findOne({ where: { id } });
+        return entity ? this.toDomain(entity) : null;
+    }
+    
+    async save(customer: Customer): Promise<void> {
+        const entity = this.toEntity(customer);
+        await this.repository.save(entity);
+    }
+}
+```
+</CodeGroup>
+
+### **2. Adding New Input Ports**
+
+Adding new protocols (REST, gRPC, MCP) becomes straightforward since they all interact with the same application services:
+
+<CodeGroup>
+```java Java
+// Application Service (unchanged regardless of input port)
+@Service
+public class CustomerService {
+    private final CustomerRepository customerRepository;
+    
+    public CustomerService(CustomerRepository customerRepository) {
+        this.customerRepository = customerRepository;
+    }
+    
+    public Customer getCustomer(Long id) {
+        return customerRepository.findById(id);
+    }
+    
+    public void updateCustomer(Customer customer) {
+        customerRepository.save(customer);
+    }
+}
+
+// Input Port 1 - REST Controller
+@RestController
+@RequestMapping("/api/customers")
+public class CustomerRestController {
+    private final CustomerService customerService;
+    
+    @GetMapping("/{id}")
+    public ResponseEntity<CustomerDto> getCustomer(@PathVariable Long id) {
+        Customer customer = customerService.getCustomer(id);
+        return ResponseEntity.ok(mapper.toDto(customer));
+    }
+}
+
+// Input Port 2 - gRPC Service (easy to add)
+@GrpcService
+public class CustomerGrpcService extends CustomerServiceGrpc.CustomerServiceImplBase {
+    private final CustomerService customerService;
+    
+    @Override
+    public void getCustomer(GetCustomerRequest request, 
+                           StreamObserver<GetCustomerResponse> responseObserver) {
+        Customer customer = customerService.getCustomer(request.getId());
+        GetCustomerResponse response = mapper.toGrpcResponse(customer);
+        responseObserver.onNext(response);
+        responseObserver.onCompleted();
+    }
+}
+
+// Input Port 3 - MCP Handler (easy to add)
+@Component
+public class CustomerMcpHandler {
+    private final CustomerService customerService;
+    
+    @McpTool("get_customer")
+    public McpResponse getCustomer(McpRequest request) {
+        Long id = Long.valueOf(request.getParameter("id"));
+        Customer customer = customerService.getCustomer(id);
+        return McpResponse.success(mapper.toMcpResult(customer));
+    }
+}
+```
+
+```csharp C#
+// Application Service (unchanged regardless of input port)
+public class CustomerService {
+    private readonly ICustomerRepository _customerRepository;
+    
+    public CustomerService(ICustomerRepository customerRepository) {
+        _customerRepository = customerRepository;
+    }
+    
+    public async Task<Customer> GetCustomerAsync(long id) {
+        return await _customerRepository.FindByIdAsync(id);
+    }
+    
+    public async Task UpdateCustomerAsync(Customer customer) {
+        await _customerRepository.SaveAsync(customer);
+    }
+}
+
+// Input Port 1 - REST Controller
+[ApiController]
+[Route("api/[controller]")]
+public class CustomersController : ControllerBase {
+    private readonly CustomerService _customerService;
+    
+    public CustomersController(CustomerService customerService) {
+        _customerService = customerService;
+    }
+    
+    [HttpGet("{id}")]
+    public async Task<ActionResult<CustomerDto>> GetCustomer(long id) {
+        var customer = await _customerService.GetCustomerAsync(id);
+        return Ok(_mapper.ToDto(customer));
+    }
+}
+
+// Input Port 2 - gRPC Service (easy to add)
+public class CustomerGrpcService : CustomerService.CustomerServiceBase {
+    private readonly Services.CustomerService _customerService;
+    
+    public override async Task<GetCustomerResponse> GetCustomer(
+        GetCustomerRequest request, ServerCallContext context) {
+        var customer = await _customerService.GetCustomerAsync(request.Id);
+        return _mapper.ToGrpcResponse(customer);
+    }
+}
+
+// Input Port 3 - SignalR Hub (easy to add)
+public class CustomerHub : Hub {
+    private readonly Services.CustomerService _customerService;
+    
+    public async Task GetCustomer(long id) {
+        var customer = await _customerService.GetCustomerAsync(id);
+        await Clients.Caller.SendAsync("CustomerData", _mapper.ToHubResponse(customer));
+    }
+}
+```
+
+```javascript JavaScript
+// Application Service (unchanged regardless of input port)
+class CustomerService {
+    constructor(customerRepository) {
+        this.customerRepository = customerRepository;
+    }
+    
+    async getCustomer(id) {
+        return await this.customerRepository.findById(id);
+    }
+    
+    async updateCustomer(customer) {
+        await this.customerRepository.save(customer);
+    }
+}
+
+// Input Port 1 - Express REST API
+app.get('/api/customers/:id', async (req, res) => {
+    try {
+        const customer = await customerService.getCustomer(req.params.id);
+        res.json(mapper.toDto(customer));
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Input Port 2 - GraphQL Resolver (easy to add)
+const resolvers = {
+    Query: {
+        customer: async (parent, { id }) => {
+            const customer = await customerService.getCustomer(id);
+            return mapper.toGraphQLResponse(customer);
+        }
+    }
+};
+
+// Input Port 3 - WebSocket Handler (easy to add)
+io.on('connection', (socket) => {
+    socket.on('getCustomer', async (data) => {
+        try {
+            const customer = await customerService.getCustomer(data.id);
+            socket.emit('customerData', mapper.toSocketResponse(customer));
+        } catch (error) {
+            socket.emit('error', { message: error.message });
+        }
+    });
+});
+```
+
+```typescript TypeScript
+// Application Service (unchanged regardless of input port)
+class CustomerService {
+    constructor(private customerRepository: CustomerRepository) {}
+    
+    async getCustomer(id: number): Promise<Customer> {
+        return await this.customerRepository.findById(id);
+    }
+    
+    async updateCustomer(customer: Customer): Promise<void> {
+        await this.customerRepository.save(customer);
+    }
+}
+
+// Input Port 1 - Express REST API
+router.get('/customers/:id', async (req: Request, res: Response) => {
+    try {
+        const customer = await customerService.getCustomer(parseInt(req.params.id));
+        res.json(mapper.toDto(customer));
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Input Port 2 - tRPC Procedure (easy to add)
+const customerRouter = router({
+    getCustomer: publicProcedure
+        .input(z.object({ id: z.number() }))
+        .query(async ({ input }) => {
+            const customer = await customerService.getCustomer(input.id);
+            return mapper.toTrpcResponse(customer);
+        })
+});
+
+// Input Port 3 - Fastify Plugin (easy to add)
+async function customerPlugin(fastify: FastifyInstance) {
+    fastify.get<{ Params: { id: string } }>('/customers/:id', async (request, reply) => {
+        const customer = await customerService.getCustomer(parseInt(request.params.id));
+        return mapper.toDto(customer);
+    });
+}
+```
+</CodeGroup>
+
+## Key Implementation Guidelines
+
+### **1. Define Clear Port Interfaces**
+- Keep interfaces focused and cohesive
+- Use domain language, not technical terminology
+- Define contracts that make sense from the business perspective
+
+### **2. Implement Dependency Inversion**
+- Application core depends on abstractions (ports), not concretions
+- Infrastructure adapters depend on and implement the port interfaces
+- Use dependency injection to wire adapters to ports
+
+### **3. Keep Adapters Thin**
+- Adapters should only handle technology-specific concerns
+- Business logic stays in the domain/application layers
+- Adapters translate between external formats and domain models
+
+### **4. Design for Testability**
+- Mock port interfaces for unit testing
+- Test adapters separately with integration tests
+- Use test doubles to verify adapter interactions
+
+## Benefits in Practice
+
+### **Easy Technology Migration**
+- **Database**: Switch from PostgreSQL to MongoDB without changing business logic
+- **Messaging**: Move from RabbitMQ to Apache Kafka with minimal impact
+- **Caching**: Add Redis or switch between caching providers seamlessly
+
+### **Multiple Interface Support**
+- **API Protocols**: Support REST, GraphQL, and gRPC simultaneously
+- **Event Sources**: Handle HTTP requests, message queues, and scheduled tasks
+- **Client Types**: Serve web apps, mobile apps, and CLI tools from the same core
+
+### **Simplified Testing**
+- **Unit Tests**: Test business logic in isolation using port mocks
+- **Integration Tests**: Test each adapter independently
+- **Contract Tests**: Verify port implementations meet interface contracts
+
+## Conclusion
+
+The Ports & Adapters architecture pattern is essential for building adaptable microservices. By establishing clear boundaries between business logic and external concerns, it enables:
+
+- **Technology flexibility** - Easy swapping of databases, messaging systems, and frameworks
+- **Protocol agnostic design** - Support multiple input and output interfaces
+- **Testability** - Clean separation enables comprehensive testing strategies
+- **Future-proofing** - New requirements can be accommodated without core changes
+
+This architectural approach ensures your microservices remain maintainable and adaptable as technology landscapes and business requirements evolve.

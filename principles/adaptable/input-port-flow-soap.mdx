@@ -1,0 +1,620 @@
+---
+title: "SOAP Input Port Flow"
+description: "Implementation pattern for SOAP input ports with protocol-specific guidance and code examples."
+---
+
+# SOAP Input Port Flow
+
+This document shows how to implement the universal input port flow pattern specifically for SOAP web services, including appropriate fault handling and SOAP conventions.
+
+## SOAP Specific Flow
+
+1. **Authenticate and authorize** the request using WS-Security, HTTP Basic Auth, or custom authentication mechanisms. Return SOAP faults for authentication/authorization failures.
+
+2. **Receive inbound SOAP message** with XML payload conforming to WSDL contract via web service operations.
+
+3. **Validate request message** against WSDL schema and business rules. Return schema validation faults or business validation faults for invalid input.
+
+4. **Map SOAP parameters** to Application Core command/query objects using dedicated mappers.
+
+5. **Invoke Application Core service** with mapped objects to execute business logic.
+
+6. **Handle system exceptions** with SOAP fault responses. Return appropriate fault codes and sanitized fault strings.
+
+7. **Process successful business operations**:
+   - Return structured SOAP response messages conforming to WSDL
+   - Include appropriate response elements and attributes
+   - Maintain SOAP envelope structure
+
+8. **Process business logic failures**:
+   - Return business-specific SOAP faults with appropriate fault codes
+   - Include detailed fault information in fault details
+   - Maintain WSDL compliance for fault contracts
+
+## Implementation Example
+
+<CodeGroup>
+```java Java
+// Using JAX-WS
+@WebService(serviceName = "CustomerService", 
+           portName = "CustomerServicePort",
+           targetNamespace = "http://example.com/customer")
+@SOAPBinding(style = SOAPBinding.Style.DOCUMENT)
+public class CustomerWebService {
+    private final IAuthenticationService authService;
+    private final IValidationService validationService;
+    private final ICustomerService customerService;
+    private final ICustomerMapper mapper;
+    
+    public CustomerWebService(IAuthenticationService authService,
+                             IValidationService validationService,
+                             ICustomerService customerService,
+                             ICustomerMapper mapper) {
+        this.authService = authService;
+        this.validationService = validationService;
+        this.customerService = customerService;
+        this.mapper = mapper;
+    }
+    
+    @WebMethod(operationName = "CreateCustomer")
+    @WebResult(name = "CreateCustomerResponse")
+    public CreateCustomerResponse createCustomer(
+            @WebParam(name = "CreateCustomerRequest") CreateCustomerRequest request)
+            throws CustomerFault {
+        
+        try {
+            // 1. Authentication & Authorization
+            var messageContext = context.getMessageContext();
+            var authResult = authService.authenticate(messageContext);
+            if (!authResult.isAuthenticated()) {
+                throw new SOAPFaultException(SOAPFactory.newInstance().createFault(
+                    "Authentication failed", 
+                    new QName("http://example.com/customer", "AuthenticationFault")));
+            }
+            
+            if (!authService.isAuthorized(authResult.getUser(), "customer:create")) {
+                throw new SOAPFaultException(SOAPFactory.newInstance().createFault(
+                    "Insufficient permissions", 
+                    new QName("http://example.com/customer", "AuthorizationFault")));
+            }
+            
+            // 3. Input Validation
+            var validationResult = validationService.validate(request);
+            if (!validationResult.isValid()) {
+                var validationFault = new ValidationFault();
+                validationFault.setMessage("Validation failed");
+                validationFault.getValidationErrors().addAll(
+                    validationResult.getErrors().stream()
+                        .map(error -> new ValidationError(error.getField(), error.getMessage()))
+                        .collect(Collectors.toList()));
+                
+                throw new CustomerFault("Validation failed", validationFault);
+            }
+            
+            // 4. Map SOAP request to Application Core object
+            var customerCommand = mapper.toCreateCommand(request);
+            
+            // 5. Invoke Application Core service
+            var result = customerService.createCustomer(customerCommand);
+            
+            // 7. Process successful response
+            if (result.isSuccess()) {
+                return mapper.toSoapResponse(result.getValue());
+            }
+            
+            // 8. Process business logic failures
+            var businessFault = switch (result.getErrorType()) {
+                case DUPLICATE_EMAIL -> {
+                    var fault = new BusinessFault();
+                    fault.setErrorCode("DUPLICATE_EMAIL");
+                    fault.setMessage("Email already exists");
+                    yield fault;
+                }
+                case INVALID_BUSINESS_RULE -> {
+                    var fault = new BusinessFault();
+                    fault.setErrorCode("BUSINESS_RULE_VIOLATION");
+                    fault.setMessage(result.getErrorMessage());
+                    yield fault;
+                }
+                case NOT_FOUND -> {
+                    var fault = new BusinessFault();
+                    fault.setErrorCode("RESOURCE_NOT_FOUND");
+                    fault.setMessage("Resource not found");
+                    yield fault;
+                }
+                default -> {
+                    var fault = new BusinessFault();
+                    fault.setErrorCode("INVALID_REQUEST");
+                    fault.setMessage(result.getErrorMessage());
+                    yield fault;
+                }
+            };
+            
+            throw new CustomerFault(result.getErrorMessage(), businessFault);
+            
+        } catch (CustomerFault e) {
+            throw e; // Re-throw business faults as-is
+        } catch (SOAPFaultException e) {
+            throw e; // Re-throw SOAP faults as-is
+        } catch (Exception ex) {
+            // 6. Handle unhandled exceptions
+            throw new SOAPFaultException(SOAPFactory.newInstance().createFault(
+                "An internal error occurred", 
+                new QName("http://schemas.xmlsoap.org/soap/envelope/", "Server")));
+        }
+    }
+    
+    @Resource
+    private WebServiceContext context;
+}
+
+// Custom fault classes
+@WebFault(name = "CustomerFault", targetNamespace = "http://example.com/customer")
+public class CustomerFault extends Exception {
+    private BusinessFault faultInfo;
+    
+    public CustomerFault(String message, BusinessFault faultInfo) {
+        super(message);
+        this.faultInfo = faultInfo;
+    }
+    
+    public BusinessFault getFaultInfo() {
+        return faultInfo;
+    }
+}
+```
+
+```csharp C#
+// Using WCF
+[ServiceContract(Namespace = "http://example.com/customer")]
+public interface ICustomerService {
+    [OperationContract]
+    [FaultContract(typeof(ValidationFault))]
+    [FaultContract(typeof(BusinessFault))]
+    [FaultContract(typeof(SystemFault))]
+    CreateCustomerResponse CreateCustomer(CreateCustomerRequest request);
+}
+
+[ServiceBehavior(InstanceContextMode = InstanceContextMode.PerCall)]
+public class CustomerService : ICustomerService {
+    private readonly IAuthenticationService _authService;
+    private readonly IValidationService _validationService;
+    private readonly ICustomerApplicationService _customerService;
+    private readonly ICustomerMapper _mapper;
+    
+    public CustomerService(
+        IAuthenticationService authService,
+        IValidationService validationService,
+        ICustomerApplicationService customerService,
+        ICustomerMapper mapper) {
+        _authService = authService;
+        _validationService = validationService;
+        _customerService = customerService;
+        _mapper = mapper;
+    }
+    
+    public CreateCustomerResponse CreateCustomer(CreateCustomerRequest request) {
+        try {
+            // 1. Authentication & Authorization
+            var operationContext = OperationContext.Current;
+            var authResult = _authService.Authenticate(operationContext);
+            if (!authResult.IsAuthenticated) {
+                throw new FaultException<SystemFault>(
+                    new SystemFault { ErrorCode = "UNAUTHENTICATED", Message = "Authentication failed" },
+                    "Authentication failed");
+            }
+            
+            if (!_authService.IsAuthorized(authResult.User, "customer:create")) {
+                throw new FaultException<SystemFault>(
+                    new SystemFault { ErrorCode = "FORBIDDEN", Message = "Insufficient permissions" },
+                    "Insufficient permissions");
+            }
+            
+            // 3. Input Validation
+            var validationResult = _validationService.Validate(request);
+            if (!validationResult.IsValid) {
+                var validationFault = new ValidationFault {
+                    Message = "Validation failed",
+                    ValidationErrors = validationResult.Errors.Select(error => 
+                        new ValidationError { Field = error.Field, Message = error.Message }).ToList()
+                };
+                
+                throw new FaultException<ValidationFault>(validationFault, "Validation failed");
+            }
+            
+            // 4. Map SOAP request to Application Core object
+            var customerCommand = _mapper.ToCreateCommand(request);
+            
+            // 5. Invoke Application Core service
+            var result = _customerService.CreateCustomer(customerCommand);
+            
+            // 7. Process successful response
+            if (result.IsSuccess) {
+                return _mapper.ToSoapResponse(result.Value);
+            }
+            
+            // 8. Process business logic failures
+            var businessFault = result.ErrorType switch {
+                CustomerErrorType.DuplicateEmail => new BusinessFault {
+                    ErrorCode = "DUPLICATE_EMAIL",
+                    Message = "Email already exists"
+                },
+                CustomerErrorType.InvalidBusinessRule => new BusinessFault {
+                    ErrorCode = "BUSINESS_RULE_VIOLATION",
+                    Message = result.ErrorMessage
+                },
+                CustomerErrorType.NotFound => new BusinessFault {
+                    ErrorCode = "RESOURCE_NOT_FOUND",
+                    Message = "Resource not found"
+                },
+                _ => new BusinessFault {
+                    ErrorCode = "INVALID_REQUEST",
+                    Message = result.ErrorMessage
+                }
+            };
+            
+            throw new FaultException<BusinessFault>(businessFault, result.ErrorMessage);
+            
+        } catch (FaultException) {
+            throw; // Re-throw fault exceptions as-is
+        } catch (Exception ex) {
+            // 6. Handle unhandled exceptions
+            throw new FaultException<SystemFault>(
+                new SystemFault { ErrorCode = "INTERNAL_ERROR", Message = "An internal error occurred" },
+                "An internal error occurred");
+        }
+    }
+}
+
+// Fault contracts
+[DataContract(Namespace = "http://example.com/customer")]
+public class ValidationFault {
+    [DataMember]
+    public string Message { get; set; }
+    
+    [DataMember]
+    public List<ValidationError> ValidationErrors { get; set; } = new List<ValidationError>();
+}
+
+[DataContract(Namespace = "http://example.com/customer")]
+public class BusinessFault {
+    [DataMember]
+    public string ErrorCode { get; set; }
+    
+    [DataMember]
+    public string Message { get; set; }
+}
+
+[DataContract(Namespace = "http://example.com/customer")]
+public class SystemFault {
+    [DataMember]
+    public string ErrorCode { get; set; }
+    
+    [DataMember]
+    public string Message { get; set; }
+}
+```
+
+```javascript JavaScript
+// Using node-soap
+const soap = require('soap');
+const express = require('express');
+
+class CustomerSoapService {
+    constructor(authService, validationService, customerService, mapper) {
+        this.authService = authService;
+        this.validationService = validationService;
+        this.customerService = customerService;
+        this.mapper = mapper;
+    }
+    
+    async CreateCustomer(args, callback, headers, req) {
+        try {
+            // 1. Authentication & Authorization
+            const authResult = await this.authService.authenticate(headers, req);
+            if (!authResult.isAuthenticated) {
+                const fault = {
+                    Fault: {
+                        faultcode: 'Client.Authentication',
+                        faultstring: 'Authentication failed',
+                        detail: {
+                            errorCode: 'UNAUTHENTICATED'
+                        }
+                    }
+                };
+                return callback(fault);
+            }
+            
+            if (!await this.authService.isAuthorized(authResult.user, 'customer:create')) {
+                const fault = {
+                    Fault: {
+                        faultcode: 'Client.Authorization',
+                        faultstring: 'Insufficient permissions',
+                        detail: {
+                            errorCode: 'FORBIDDEN'
+                        }
+                    }
+                };
+                return callback(fault);
+            }
+            
+            // 2. Receive SOAP parameters
+            const request = args.CreateCustomerRequest;
+            
+            // 3. Input Validation
+            const validationResult = await this.validationService.validate(request);
+            if (!validationResult.isValid) {
+                const fault = {
+                    Fault: {
+                        faultcode: 'Client.Validation',
+                        faultstring: 'Validation failed',
+                        detail: {
+                            errorCode: 'VALIDATION_ERROR',
+                            validationErrors: validationResult.errors.map(error => ({
+                                field: error.field,
+                                message: error.message
+                            }))
+                        }
+                    }
+                };
+                return callback(fault);
+            }
+            
+            // 4. Map SOAP request to Application Core object
+            const customerCommand = this.mapper.toCreateCommand(request);
+            
+            // 5. Invoke Application Core service
+            const result = await this.customerService.createCustomer(customerCommand);
+            
+            // 7. Process successful response
+            if (result.isSuccess) {
+                const response = this.mapper.toSoapResponse(result.value);
+                return callback(null, { CreateCustomerResponse: response });
+            }
+            
+            // 8. Process business logic failures
+            let errorCode, faultcode;
+            switch (result.errorType) {
+                case 'DUPLICATE_EMAIL':
+                    errorCode = 'DUPLICATE_EMAIL';
+                    faultcode = 'Client.Business';
+                    break;
+                case 'INVALID_BUSINESS_RULE':
+                    errorCode = 'BUSINESS_RULE_VIOLATION';
+                    faultcode = 'Client.Business';
+                    break;
+                case 'NOT_FOUND':
+                    errorCode = 'RESOURCE_NOT_FOUND';
+                    faultcode = 'Client.Business';
+                    break;
+                default:
+                    errorCode = 'INVALID_REQUEST';
+                    faultcode = 'Client.Request';
+            }
+            
+            const businessFault = {
+                Fault: {
+                    faultcode: faultcode,
+                    faultstring: result.errorMessage,
+                    detail: {
+                        errorCode: errorCode,
+                        errorType: result.errorType
+                    }
+                }
+            };
+            
+            callback(businessFault);
+            
+        } catch (error) {
+            // 6. Handle unhandled exceptions
+            console.error('Unhandled exception in SOAP service:', error);
+            const fault = {
+                Fault: {
+                    faultcode: 'Server.Internal',
+                    faultstring: 'An internal error occurred',
+                    detail: {
+                        errorCode: 'INTERNAL_ERROR'
+                    }
+                }
+            };
+            callback(fault);
+        }
+    }
+}
+
+// Service setup
+const service = {
+    CustomerService: {
+        CustomerServicePort: new CustomerSoapService(
+            authService, validationService, customerService, mapper
+        )
+    }
+};
+
+const xml = require('fs').readFileSync('customer.wsdl', 'utf8');
+const app = express();
+const server = app.listen(3000, () => {
+    soap.listen(server, '/customer', service, xml);
+});
+```
+
+```typescript TypeScript
+// Using TypeScript with strong typing
+interface ICustomerSoapService {
+    CreateCustomer(request: CreateCustomerRequest): Promise<CreateCustomerResponse>;
+}
+
+export class CustomerSoapService implements ICustomerSoapService {
+    constructor(
+        private readonly authService: IAuthenticationService,
+        private readonly validationService: IValidationService,
+        private readonly customerService: ICustomerService,
+        private readonly mapper: ICustomerMapper
+    ) {}
+    
+    async CreateCustomer(request: CreateCustomerRequest): Promise<CreateCustomerResponse> {
+        try {
+            // 1. Authentication & Authorization
+            const context = SoapContext.current();
+            const authResult = await this.authService.authenticate(context.headers);
+            if (!authResult.isAuthenticated) {
+                throw new SoapFault('Authentication failed', 'Client.Authentication', {
+                    errorCode: 'UNAUTHENTICATED'
+                });
+            }
+            
+            if (!await this.authService.isAuthorized(authResult.user, 'customer:create')) {
+                throw new SoapFault('Insufficient permissions', 'Client.Authorization', {
+                    errorCode: 'FORBIDDEN'
+                });
+            }
+            
+            // 3. Input Validation
+            const validationResult = await this.validationService.validate(request);
+            if (!validationResult.isValid) {
+                throw new SoapFault('Validation failed', 'Client.Validation', {
+                    errorCode: 'VALIDATION_ERROR',
+                    validationErrors: validationResult.errors.map(error => ({
+                        field: error.field,
+                        message: error.message
+                    }))
+                });
+            }
+            
+            // 4. Map SOAP request to Application Core object
+            const customerCommand = this.mapper.toCreateCommand(request);
+            
+            // 5. Invoke Application Core service
+            const result = await this.customerService.createCustomer(customerCommand);
+            
+            // 7. Process successful response
+            if (result.isSuccess) {
+                return this.mapper.toSoapResponse(result.value);
+            }
+            
+            // 8. Process business logic failures
+            const { errorCode, faultcode } = this.mapErrorTypeToSoapFault(result.errorType);
+            
+            throw new SoapFault(result.errorMessage, faultcode, {
+                errorCode,
+                errorType: result.errorType
+            });
+            
+        } catch (error) {
+            if (error instanceof SoapFault) {
+                throw error; // Re-throw SOAP faults as-is
+            }
+            
+            // 6. Handle unhandled exceptions
+            console.error('Unhandled exception in SOAP service:', error);
+            throw new SoapFault('An internal error occurred', 'Server.Internal', {
+                errorCode: 'INTERNAL_ERROR'
+            });
+        }
+    }
+    
+    private mapErrorTypeToSoapFault(errorType: CustomerErrorType): { errorCode: string, faultcode: string } {
+        switch (errorType) {
+            case CustomerErrorType.DuplicateEmail:
+                return { errorCode: 'DUPLICATE_EMAIL', faultcode: 'Client.Business' };
+            case CustomerErrorType.InvalidBusinessRule:
+                return { errorCode: 'BUSINESS_RULE_VIOLATION', faultcode: 'Client.Business' };
+            case CustomerErrorType.NotFound:
+                return { errorCode: 'RESOURCE_NOT_FOUND', faultcode: 'Client.Business' };
+            default:
+                return { errorCode: 'INVALID_REQUEST', faultcode: 'Client.Request' };
+        }
+    }
+}
+
+// SOAP Fault class
+class SoapFault extends Error {
+    constructor(
+        message: string,
+        public readonly faultcode: string,
+        public readonly detail?: any
+    ) {
+        super(message);
+        this.name = 'SoapFault';
+    }
+}
+```
+</CodeGroup>
+
+## SOAP Specific Considerations
+
+### **Fault Code Guidelines**
+- **Client.Authentication**: Authentication failures
+- **Client.Authorization**: Authorization failures  
+- **Client.Validation**: Schema validation, business validation failures
+- **Client.Business**: Business rule violations, resource conflicts
+- **Client.Request**: Malformed requests, invalid parameters
+- **Server.Internal**: System errors, unhandled exceptions
+
+### **WSDL Contract Design**
+```xml
+<definitions targetNamespace="http://example.com/customer">
+  <types>
+    <schema targetNamespace="http://example.com/customer">
+      <element name="CreateCustomerRequest">
+        <complexType>
+          <sequence>
+            <element name="email" type="string"/>
+            <element name="name" type="string"/>
+            <element name="type" type="string"/>
+          </sequence>
+        </complexType>
+      </element>
+      
+      <element name="CreateCustomerResponse">
+        <complexType>
+          <sequence>
+            <element name="id" type="string"/>
+            <element name="email" type="string"/>
+            <element name="name" type="string"/>
+            <element name="createdAt" type="dateTime"/>
+          </sequence>
+        </complexType>
+      </element>
+    </schema>
+  </types>
+  
+  <portType name="CustomerServicePortType">
+    <operation name="CreateCustomer">
+      <input message="tns:CreateCustomerRequest"/>
+      <output message="tns:CreateCustomerResponse"/>
+      <fault name="ValidationFault" message="tns:ValidationFault"/>
+      <fault name="BusinessFault" message="tns:BusinessFault"/>
+    </operation>
+  </portType>
+</definitions>
+```
+
+### **Fault Response Format**
+```xml
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <soap:Fault>
+      <faultcode>Client.Validation</faultcode>
+      <faultstring>Validation failed</faultstring>
+      <detail>
+        <ValidationFault xmlns="http://example.com/customer">
+          <errorCode>VALIDATION_ERROR</errorCode>
+          <validationErrors>
+            <validationError>
+              <field>email</field>
+              <message>Email address is required</message>
+            </validationError>
+          </validationErrors>
+        </ValidationFault>
+      </detail>
+    </soap:Fault>
+  </soap:Body>
+</soap:Envelope>
+```
+
+### **Security Considerations**
+- **WS-Security**: Use WS-Security standards for authentication and message-level security
+- **Transport Security**: Implement HTTPS for transport-level security
+- **Message Validation**: Validate against WSDL schema before processing
+- **Fault Sanitization**: Ensure fault messages don't expose sensitive information

@@ -1,0 +1,71 @@
+---
+title: Microservice Development Guide
+description: Overview and navigation for the Microservice Development Guide.
+---
+
+# Microservice Development Guide
+
+This documentation provides a practical, end-to-end approach for building microservices using hexagonal/onion architecture. 
+It covers controller design, domain layering, observability, exception handling, resiliency, and multiple service variants with examples in .NET, Node.js, and Java.
+
+
+## **Neutral With Respect to Deployment Target**
+Services must be designed to be agnostic of their deployment environment. This means they should not rely on specific infrastructure or platform features, allowing them to be easily deployed across various environments (e.g., on-premises, cloud, hybrid).
+This is achieved with architectural approaches that are detailed in this guuide.
+
+## **Shared Contracts, Not Types**
+DTOs at the service boundary / protocol layer are decoupled from domain models and other internal components. Mapping must be performed to and from the protocol-specific contract types and types that are a part of any other layer.
+
+## **Stateless**
+Services are stateless with respect to any mechanism that binds a caller to a particular instance of the service. Services must be able to scale horizontally without impact.
+
+## **Observable**
+Services are to be richly instrumented in order to facilitate rapid error detection and resolution as well as to provide insight into system behavior. These are discussed in detail in subsequent sections.
+
+**Application Performance Monitoring** - Provides complete end-to-end transaction tracing, error detection, and performance monitoring. Enables line-of-code level resolution for errors and performance issues.
+
+**Structured Logging** - Enables structured queries within log data. Avoid logging restricted data; use opaque IDs for sensitive references.
+
+**Distributed Tracing** Traces across all services in a call chain. Acts as a backup for services not using APM. Includes trace propagation across systems like Kafka.
+
+**Business Transaction Instrumentation** - Provides insights into the real-time business performance of the application by instrumenting the underlying business transactions. For example, a performance counter that instruments the monetary volume of real-time money transfers per time period
+
+## **Secure by Default**
+Services must exhibit the following characteristics, at minimum:
+- Application of the principle of least privilege for both user and service resource access.
+- All input is validated and sanitized.
+- All output is authorized, sanitized, and appropriate for the data classification of the service.  
+- Secrets and configuration are managed securely and externally.
+- Data and operations are segregated by tenant in the case of systems that support multi-tenancy.
+- Default configuration values must result in the most restrictive behavior in the absence of explicit configuration.
+
+## **Configured Externally**
+Application configuration and secrets are to be managed external to the application with the exception of fixed configuration values. Configuration should be versioned and access-controlled.
+
+
+## **Resilient**
+Services must be designed to gracefully handle transient faults and degrade functionality when necessary. They must be designed to assume operation in an active-active deployment, unless by exception. 
+
+- Even if not deployed in active-active mode, design for it.
+- If your DB doesn't support dynamic routing, maintain multiple endpoints and switch on failure.
+- Prefer client libraries that support **transparent failover**.
+- All external resource access must go through a **transient fault handling policy**, even if it's a no-op.
+- Use frameworks like **resilience4j** or **Polly**.
+- Return appropriate status codes:
+  - If an external API returns **429**, your service should also return **429** with retry info.
+  - Do **not** return **200** if there's an underlying issue.
+  - Unhandled errors are processed by a **global exception handler** and sanitized before returning to the caller. The actual message is logged.
+- Errors that cannot be handled should **bubble up** to the global handler — do not catch, log, and re-throw.
+- **Do not throw exceptions** for expected operations (e.g., validation failures). Instead, use a `ValidationResult` class and return a **400** status with error details.
+- Prefer the **Notification Pattern** (Fowler, 2014) over exceptions for validation and similar scenarios.
+- Use **custom exceptions sparingly**:
+  - Only when patterns like Request/Response or Command/Result can't convey the outcome.
+  - Only if they provide **additional context**.
+  - Avoid creating custom exceptions that merely extend base types without added value.
+
+## **Verifiable**
+The functional correctness and operational readiness of services must be demonstrable through automated testing:
+- **Unit tests** must cover at least **80%** of the codebase.  
+- **Integration tests** should build on unit tests using tools like **Test Containers**, **Dev Spaces**, or known-good environments and are to use live dependencies.
+- **Functional Automation** - The complete service interface must be tested using API tests. 
+- **Build verification tests** must validate basic functionality and connectivity (e.g., synthetic transactions across all dependencies). These are run before enabling new deployments.

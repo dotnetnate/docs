@@ -1,0 +1,152 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "Microservice Development Guide",
+  "colors": {
+    "primary": "#16A34A",
+    "light": "#07C983",
+    "dark": "#15803D"
+  },
+  "favicon": "/favicon.svg",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Guide",
+        "groups": [
+          {
+            "group": "Introduction",
+            "pages": [
+              "index"
+            ]
+          },
+          {
+            "group": "Architecture",
+            "pages": [
+              "01-core-architectural-principles",
+              "02-controller-interaction-pattern",
+              "03-microservice-variants",
+              "04-architectural-modifiers"
+            ]
+          },
+          {
+            "group": "Principles",
+            "pages": [
+              {
+                "group": "Resiliency",
+                "pages": [
+                  "principles/resilient/index",
+                  "principles/resilient/exception-handling"
+                ]
+              },
+              {
+                "group": "Adaptability",
+                "pages": [
+                  "principles/adaptable/input-port-flow",
+                  {
+                    "group": "Protocol-Specific Implementations",
+                    "pages": [
+                      "principles/adaptable/input-port-flow-http",
+                      "principles/adaptable/input-port-flow-rest",
+                      "principles/adaptable/input-port-flow-grpc",
+                      "principles/adaptable/input-port-flow-graphql",
+                      "principles/adaptable/input-port-flow-mcp",
+                      "principles/adaptable/input-port-flow-soap"
+                    ]
+                  }
+                ]
+              },
+              {
+                "group": "Observability",
+                "pages": [
+                  "principles/observable/index",
+                  "principles/observable/logging"
+                ]
+              },
+              {
+                "group": "Security",
+                "pages": [
+                  "principles/secure/index"
+                ]
+              }
+            ]            
+          },
+          {
+            "group": "Resiliency & Core",
+            "pages": [
+              "05-resiliency-patterns",
+              "06-core-components",
+              "07-result-pattern"
+            ]
+          },
+          {
+            "group": "Operations",
+            "pages": [
+              "08-observability",
+              "09-global-exception-handling",
+              "10-folder-structures",
+              "11-data-messaging-boundaries",
+              "12-resiliency-configuration",
+              "13-testing-strategy",
+              "14-security-compliance",
+              "15-configuration-environments",
+              "16-deployment-operations"
+            ]
+          },
+          {
+            "group": "Appendix",
+            "pages": [
+              "17-appendix-dto-error-envelopes",
+              "18-quick-start-checklists",
+              "19-instrumentation-guidance"
+            ]
+          }
+        ]
+      }
+    ],
+    "global": {
+      "anchors": [
+        {
+          "anchor": "GitHub",
+          "href": "https://github.com/",
+          "icon": "github"
+        }
+      ]
+    }
+  },
+  "logo": {
+    "light": "/logo/light.svg",
+    "dark": "/logo/dark.svg"
+  },
+  "navbar": {
+    "links": [
+      {
+        "label": "Support",
+        "href": "mailto:support@example.com"
+      }
+    ],
+    "primary": {
+      "type": "button",
+      "label": "Dashboard",
+      "href": "https://dashboard.example.com"
+    }
+  },
+  "contextual": {
+    "options": [
+      "copy",
+      "view",
+      "chatgpt",
+      "claude",
+      "perplexity",
+      "mcp",
+      "cursor",
+      "vscode"
+    ]
+  },
+  "footer": {
+    "socials": {
+      "x": "https://x.com/example",
+      "github": "https://github.com/example",
+      "linkedin": "https://linkedin.com/company/example"
+    }
+  }
+}

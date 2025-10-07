@@ -1,0 +1,293 @@
+# Data Sanitization & PII Protection
+
+## **PII Identification Patterns**
+
+<CodeGroup>
+```java Java
+// PII detection and sanitization utility
+@Component
+public class PiiSanitizer {
+    
+    private static final Pattern EMAIL_PATTERN = 
+        Pattern.compile("\\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Z|a-z]{2,}\\b");
+    private static final Pattern PHONE_PATTERN = 
+        Pattern.compile("\\b\\d{3}[-.]?\\d{3}[-.]?\\d{4}\\b");
+    private static final Pattern SSN_PATTERN = 
+        Pattern.compile("\\b\\d{3}-\\d{2}-\\d{4}\\b");
+    private static final Pattern CREDIT_CARD_PATTERN = 
+        Pattern.compile("\\b\\d{4}[\\s-]?\\d{4}[\\s-]?\\d{4}[\\s-]?\\d{4}\\b");
+    
+    private static final Set<String> PII_FIELD_NAMES = Set.of(
+        "email", "emailaddress", "mail", "username",
+        "firstname", "lastname", "fullname", "name",
+        "phone", "phonenumber", "mobile", "telephone",
+        "address", "street", "city", "zipcode", "postalcode",
+        "ssn", "socialsecurity", "taxid",
+        "creditcard", "cardnumber", "accountnumber",
+        "password", "secret", "token", "key"
+    );
+    
+    public String sanitizeText(String text) {
+        if (text == null) return null;
+        
+        return text
+            .replaceAll(EMAIL_PATTERN.pattern(), "***EMAIL***")
+            .replaceAll(PHONE_PATTERN.pattern(), "***PHONE***")
+            .replaceAll(SSN_PATTERN.pattern(), "***SSN***")
+            .replaceAll(CREDIT_CARD_PATTERN.pattern(), "***CARD***");
+    }
+    
+    public Object sanitizeValue(String fieldName, Object value) {
+        if (value == null) return null;
+        
+        String normalizedFieldName = fieldName.toLowerCase().replaceAll("[^a-z]", "");
+        
+        if (PII_FIELD_NAMES.contains(normalizedFieldName)) {
+            return "***REDACTED***";
+        }
+        
+        if (value instanceof String) {
+            return sanitizeText((String) value);
+        }
+        
+        return value;
+    }
+    
+    public Map<String, Object> sanitizeMap(Map<String, Object> data) {
+        Map<String, Object> sanitized = new HashMap<>();
+        
+        data.forEach((key, value) -> {
+            if (value instanceof Map) {
+                sanitized.put(key, sanitizeMap((Map<String, Object>) value));
+            } else if (value instanceof Collection) {
+                sanitized.put(key, sanitizeCollection((Collection<?>) value));
+            } else {
+                sanitized.put(key, sanitizeValue(key, value));
+            }
+        });
+        
+        return sanitized;
+    }
+    
+    private Collection<?> sanitizeCollection(Collection<?> collection) {
+        return collection.stream()
+            .map(item -> item instanceof Map ? 
+                sanitizeMap((Map<String, Object>) item) : item)
+            .collect(Collectors.toList());
+    }
+}
+```
+
+```csharp C#
+// PII detection and sanitization utility
+public class PiiSanitizer {
+    private static readonly Regex EmailPattern = 
+        new(@"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b", RegexOptions.Compiled);
+    private static readonly Regex PhonePattern = 
+        new(@"\b\d{3}[-.]?\d{3}[-.]?\d{4}\b", RegexOptions.Compiled);
+    private static readonly Regex SsnPattern = 
+        new(@"\b\d{3}-\d{2}-\d{4}\b", RegexOptions.Compiled);
+    private static readonly Regex CreditCardPattern = 
+        new(@"\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b", RegexOptions.Compiled);
+    
+    private static readonly HashSet<string> PiiFieldNames = new(StringComparer.OrdinalIgnoreCase) {
+        "email", "emailaddress", "mail", "username",
+        "firstname", "lastname", "fullname", "name",
+        "phone", "phonenumber", "mobile", "telephone",
+        "address", "street", "city", "zipcode", "postalcode",
+        "ssn", "socialsecurity", "taxid",
+        "creditcard", "cardnumber", "accountnumber",
+        "password", "secret", "token", "key"
+    };
+    
+    public string SanitizeText(string text) {
+        if (string.IsNullOrEmpty(text)) return text;
+        
+        return EmailPattern.Replace(
+            PhonePattern.Replace(
+                SsnPattern.Replace(
+                    CreditCardPattern.Replace(text, "***CARD***"),
+                    "***SSN***"),
+                "***PHONE***"),
+            "***EMAIL***");
+    }
+    
+    public object SanitizeValue(string fieldName, object value) {
+        if (value == null) return null;
+        
+        string normalizedFieldName = Regex.Replace(fieldName.ToLower(), @"[^a-z]", "");
+        
+        if (PiiFieldNames.Contains(normalizedFieldName)) {
+            return "***REDACTED***";
+        }
+        
+        if (value is string stringValue) {
+            return SanitizeText(stringValue);
+        }
+        
+        return value;
+    }
+    
+    public Dictionary<string, object> SanitizeMap(Dictionary<string, object> data) {
+        var sanitized = new Dictionary<string, object>();
+        
+        foreach (var kvp in data) {
+            if (kvp.Value is Dictionary<string, object> nestedMap) {
+                sanitized[kvp.Key] = SanitizeMap(nestedMap);
+            } else if (kvp.Value is IEnumerable<object> collection) {
+                sanitized[kvp.Key] = SanitizeCollection(collection);
+            } else {
+                sanitized[kvp.Key] = SanitizeValue(kvp.Key, kvp.Value);
+            }
+        }
+        
+        return sanitized;
+    }
+    
+    private IEnumerable<object> SanitizeCollection(IEnumerable<object> collection) {
+        return collection.Select(item => 
+            item is Dictionary<string, object> map ? SanitizeMap(map) : item);
+    }
+}
+```
+
+```javascript JavaScript
+// PII detection and sanitization utility
+class PiiSanitizer {
+    constructor() {
+        this.patterns = {
+            email: /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b/g,
+            phone: /\b\d{3}[-.]?\d{3}[-.]?\d{4}\b/g,
+            ssn: /\b\d{3}-\d{2}-\d{4}\b/g,
+            creditCard: /\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b/g
+        };
+        
+        this.piiFieldNames = new Set([
+            'email', 'emailaddress', 'mail', 'username',
+            'firstname', 'lastname', 'fullname', 'name',
+            'phone', 'phonenumber', 'mobile', 'telephone',
+            'address', 'street', 'city', 'zipcode', 'postalcode',
+            'ssn', 'socialsecurity', 'taxid',
+            'creditcard', 'cardnumber', 'accountnumber',
+            'password', 'secret', 'token', 'key'
+        ]);
+    }
+    
+    sanitizeText(text) {
+        if (!text || typeof text !== 'string') return text;
+        
+        return text
+            .replace(this.patterns.email, '***EMAIL***')
+            .replace(this.patterns.phone, '***PHONE***')
+            .replace(this.patterns.ssn, '***SSN***')
+            .replace(this.patterns.creditCard, '***CARD***');
+    }
+    
+    sanitizeValue(fieldName, value) {
+        if (value === null || value === undefined) return value;
+        
+        const normalizedFieldName = fieldName.toLowerCase().replace(/[^a-z]/g, '');
+        
+        if (this.piiFieldNames.has(normalizedFieldName)) {
+            return '***REDACTED***';
+        }
+        
+        if (typeof value === 'string') {
+            return this.sanitizeText(value);
+        }
+        
+        return value;
+    }
+    
+    sanitizeObject(data) {
+        if (!data || typeof data !== 'object') return data;
+        
+        if (Array.isArray(data)) {
+            return data.map(item => this.sanitizeObject(item));
+        }
+        
+        const sanitized = {};
+        
+        for (const [key, value] of Object.entries(data)) {
+            if (value && typeof value === 'object') {
+                sanitized[key] = this.sanitizeObject(value);
+            } else {
+                sanitized[key] = this.sanitizeValue(key, value);
+            }
+        }
+        
+        return sanitized;
+    }
+}
+
+module.exports = { PiiSanitizer };
+```
+
+```typescript TypeScript
+// PII detection and sanitization utility
+export class PiiSanitizer {
+    private readonly patterns = {
+        email: /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b/g,
+        phone: /\b\d{3}[-.]?\d{3}[-.]?\d{4}\b/g,
+        ssn: /\b\d{3}-\d{2}-\d{4}\b/g,
+        creditCard: /\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b/g
+    };
+    
+    private readonly piiFieldNames = new Set([
+        'email', 'emailaddress', 'mail', 'username',
+        'firstname', 'lastname', 'fullname', 'name',
+        'phone', 'phonenumber', 'mobile', 'telephone',
+        'address', 'street', 'city', 'zipcode', 'postalcode',
+        'ssn', 'socialsecurity', 'taxid',
+        'creditcard', 'cardnumber', 'accountnumber',
+        'password', 'secret', 'token', 'key'
+    ]);
+    
+    sanitizeText(text: string): string {
+        if (!text) return text;
+        
+        return text
+            .replace(this.patterns.email, '***EMAIL***')
+            .replace(this.patterns.phone, '***PHONE***')
+            .replace(this.patterns.ssn, '***SSN***')
+            .replace(this.patterns.creditCard, '***CARD***');
+    }
+    
+    sanitizeValue(fieldName: string, value: any): any {
+        if (value === null || value === undefined) return value;
+        
+        const normalizedFieldName = fieldName.toLowerCase().replace(/[^a-z]/g, '');
+        
+        if (this.piiFieldNames.has(normalizedFieldName)) {
+            return '***REDACTED***';
+        }
+        
+        if (typeof value === 'string') {
+            return this.sanitizeText(value);
+        }
+        
+        return value;
+    }
+    
+    sanitizeObject(data: any): any {
+        if (!data || typeof data !== 'object') return data;
+        
+        if (Array.isArray(data)) {
+            return data.map(item => this.sanitizeObject(item));
+        }
+        
+        const sanitized: Record<string, any> = {};
+        
+        for (const [key, value] of Object.entries(data)) {
+            if (value && typeof value === 'object') {
+                sanitized[key] = this.sanitizeObject(value);
+            } else {
+                sanitized[key] = this.sanitizeValue(key, value);
+            }
+        }
+        
+        return sanitized;
+    }
+}
+```
+</CodeGroup>

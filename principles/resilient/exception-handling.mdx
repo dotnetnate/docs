@@ -1,0 +1,1264 @@
+---
+title: "Exception Handling"
+description: "Global Exception Handling section of the Microservice Development Guide."
+---
+
+Exception handling is a critical aspect of building resilient microservices. Properly managing exceptions ensures that services can gracefully handle errors, provide meaningful feedback to clients, and maintain overall system stability.
+
+# Core Principles
+
+## **Let Exceptions Bubble Up**
+
+Avoid the anti-pattern of catching, logging, and re-throwing exceptions. This practice is detrimental for several reasons:
+
+### **Performance Impact**
+- **Stack Unwinding Cost**: Each try-catch block adds overhead during exception propagation
+- **Unnecessary Object Creation**: Re-throwing creates new exception instances and stack traces
+- **CPU Cycles**: Additional processing time for each catch-rethrow operation
+
+### **Information Loss**
+- **Stack Trace Pollution**: Re-throwing can modify or truncate the original stack trace
+- **Context Dilution**: Multiple catch-rethrow operations can obscure the original failure point
+- **Debugging Complexity**: Makes root cause analysis more difficult
+
+### **Code Complexity**
+- **Maintenance Burden**: Additional code paths that provide no functional value
+- **Testing Overhead**: More code coverage requirements without business benefit
+- **Readability Issues**: Clutters code with boilerplate exception handling
+
+## **Use Result Patterns for Expected Failures**
+
+Exceptions should only be used for truly exceptional circumstances—not for expected business logic outcomes like validation failures, not-found scenarios, or business rule violations.
+
+### **Why Result Patterns Are Superior**
+- **Performance**: No stack unwinding or exception object creation
+- **Explicit**: Forces callers to handle both success and failure cases
+- **Composable**: Can be chained and transformed easily
+- **Testable**: Easier to unit test different outcome scenarios
+
+## **Global Exception Handling Only**
+
+Unhandled exceptions should be processed exclusively by global exception handlers that:
+- **Sanitize**: Remove sensitive information before responding to clients
+- **Log**: Capture full context including correlation IDs and request details
+- **Respond**: Return appropriate HTTP status codes and error representations
+
+# Implementation Patterns
+
+## **Global Exception Handling**
+
+<CodeGroup>
+```java Java
+// Spring Boot Global Exception Handler
+@ControllerAdvice
+@Slf4j
+public class GlobalExceptionHandler {
+    
+   
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<ErrorResponse> handleGenericException(
+            Exception ex, HttpServletRequest request) {
+        
+        String correlationId = getCorrelationId(request);
+        
+        // Log full exception details - never expose to client
+        log.error("Unhandled exception in request [correlationId={}]: {}", 
+                 correlationId, ex.getMessage(), ex);
+        
+        // Return generic error response
+        ErrorResponse errorResponse = ErrorResponse.builder()
+            .message("An unexpected error occurred")
+            .code("INTERNAL_ERROR")
+            .correlationId(correlationId)
+            .timestamp(Instant.now())
+            .build();
+            
+        return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                           .body(errorResponse);
+    }
+    
+    private String getCorrelationId(HttpServletRequest request) {
+        return request.getHeader("X-Correlation-ID");
+    }
+}
+```
+
+```csharp C#
+// ASP.NET Core Global Exception Handler
+public class GlobalExceptionMiddleware {
+    private readonly RequestDelegate _next;
+    private readonly ILogger<GlobalExceptionMiddleware> _logger;
+    
+    public GlobalExceptionMiddleware(RequestDelegate next, 
+                                   ILogger<GlobalExceptionMiddleware> logger) {
+        _next = next;
+        _logger = logger;
+    }
+    
+    public async Task InvokeAsync(HttpContext context) {
+        try {
+            await _next(context);
+        } catch (Exception ex) {
+            await HandleExceptionAsync(context, ex);
+        }
+    }
+    
+    private async Task HandleExceptionAsync(HttpContext context, Exception ex) {
+        var correlationId = context.TraceIdentifier;
+        
+        // Log with full context - never expose to client
+        _logger.LogError(ex, "Unhandled exception in request [CorrelationId={CorrelationId}]: {Message}", 
+                        correlationId, ex.Message);
+        
+        var response = context.Response;
+        response.ContentType = "application/json";
+        
+        var errorResponse = ex switch {
+
+            _ => new ErrorResponse {
+                Message = "An unexpected error occurred",
+                Code = "INTERNAL_ERROR", 
+                CorrelationId = correlationId,
+                Timestamp = DateTime.UtcNow
+            }
+        };
+        
+        response.StatusCode = ex switch {
+            ArgumentException => 400,
+            _ => 500
+        };
+        
+        var jsonResponse = JsonSerializer.Serialize(errorResponse);
+        await response.WriteAsync(jsonResponse);
+    }
+}
+
+// Registration in Program.cs
+app.UseMiddleware<GlobalExceptionMiddleware>();
+```
+
+```javascript JavaScript
+// Express.js Global Error Handler
+const globalErrorHandler = (err, req, res, next) => {
+    const correlationId = req.headers['x-correlation-id'] || req.id;
+    
+    // Log with full context - never expose to client
+    logger.error('Unhandled exception in request', {
+        correlationId,
+        message: err.message,
+        stack: err.stack,
+        url: req.url,
+        method: req.method
+    });
+    
+    let statusCode = 500;
+    let errorCode = 'INTERNAL_ERROR';
+    let message = 'An unexpected error occurred';
+    
+    const errorResponse = {
+        message,
+        code: errorCode,
+        correlationId,
+        timestamp: new Date().toISOString()
+    };
+    
+    res.status(statusCode).json(errorResponse);
+};
+
+// Register as last middleware
+app.use(globalErrorHandler);
+```
+
+```typescript TypeScript
+// NestJS Global Exception Filter
+@Catch()
+export class GlobalExceptionFilter implements ExceptionFilter {
+    private readonly logger = new Logger(GlobalExceptionFilter.name);
+    
+    catch(exception: unknown, host: ArgumentsHost): void {
+        const ctx = host.switchToHttp();
+        const response = ctx.getResponse<Response>();
+        const request = ctx.getRequest<Request>();
+        
+        const correlationId = request.headers['x-correlation-id'] as string || 
+                             request.headers['x-request-id'] as string;
+        
+        let status = HttpStatus.INTERNAL_SERVER_ERROR;
+        let message = 'An unexpected error occurred';
+        let code = 'INTERNAL_ERROR';
+        
+        
+        // Log full exception details - never expose to client
+        this.logger.error(
+            `Unhandled exception in request [CorrelationId=${correlationId}]: ${exception.message}`,
+            exception.stack
+        );            
+    
+        
+        const errorResponse: ErrorResponse = {
+            message,
+            code,
+            correlationId,
+            timestamp: new Date().toISOString()
+        };
+        
+        response.status(status).json(errorResponse);
+    }
+}
+
+// Register globally
+app.useGlobalFilters(new GlobalExceptionFilter());
+```
+</CodeGroup>
+
+## **Result Pattern Implementation**
+
+<CodeGroup>
+```java Java
+// Result pattern for handling expected failures
+public class Result<T> {
+    private final boolean isSuccess;
+    private final T value;
+    private final String errorMessage;
+    private final String errorCode;
+    private final String exceptionDetails;
+    
+    private Result(boolean isSuccess, T value, String errorMessage, String errorCode, String exceptionDetails) {
+        this.isSuccess = isSuccess;
+        this.value = value;
+        this.errorMessage = errorMessage;
+        this.errorCode = errorCode;
+        this.exceptionDetails = exceptionDetails;
+    }
+    
+    public static <T> Result<T> success(T value) {
+        return new Result<>(true, value, null, null, null);
+    }
+    
+    public static <T> Result<T> failure(String errorMessage, String errorCode) {
+        return new Result<>(false, null, errorMessage, errorCode, null);
+    }
+    
+    public static <T> Result<T> failure(String errorMessage, String errorCode, String exceptionDetails) {
+        return new Result<>(false, null, errorMessage, errorCode, exceptionDetails);
+    }
+    
+    // Getters and utility methods
+    public boolean isSuccess() { return isSuccess; }
+    public T getValue() { return value; }
+    public String getErrorMessage() { return errorMessage; }
+    public String getErrorCode() { return errorCode; }
+    public String getExceptionDetails() { return exceptionDetails; }
+}
+
+// Service implementation - no validation, pure business logic
+@Service
+public class CustomerService {
+    
+    public Result<Customer> createCustomer(CreateCustomerCommand command) {
+        // Business logic only - validation handled in controller
+        if (emailAlreadyExists(command.getEmail())) {
+            return Result.failure("Email already exists", "DUPLICATE_EMAIL");
+        }
+        
+        // Successful creation
+        Customer customer = new Customer(command.getEmail(), command.getName());
+        customerRepository.save(customer);
+        
+        return Result.success(customer);
+    }
+    
+    public Result<Customer> getCustomer(GetCustomerQuery query) {
+        Customer customer = customerRepository.findById(query.getCustomerId());
+        if (customer == null) {
+            // This is expected behavior, not an exception
+            return Result.failure("Customer not found", "CUSTOMER_NOT_FOUND");
+        }
+        
+        return Result.success(customer);
+    }
+}
+
+// Controller following input port flow pattern
+@RestController
+public class CustomerController {
+    
+    private final IAuthenticationService authService;
+    private final IValidationService validationService;
+    private final ICustomerService customerService;
+    private final ICustomerMapper mapper;
+    
+    @PostMapping("/customers")
+    public ResponseEntity<?> createCustomer(@RequestBody CustomerRepresentation customerRep, 
+                                          HttpServletRequest request) {
+        
+        // 1. Authentication & Authorization  
+        var authResult = authService.authenticate(request);
+        if (!authResult.isAuthenticated()) {
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
+                .body(createErrorResponse("Authentication required", "UNAUTHENTICATED"));
+        }
+        
+        if (!authService.isAuthorized(authResult.getUser(), "customers:create")) {
+            return ResponseEntity.status(HttpStatus.FORBIDDEN)
+                .body(createErrorResponse("Insufficient permissions", "FORBIDDEN"));
+        }
+        
+        // 3. Call Validation Service
+        var validationResult = validationService.validate(customerRep);
+        if (!validationResult.isValid()) {
+            // Handle multiple validation errors
+            Map<String, String> validationErrors = validationResult.getErrors()
+                .stream()
+                .collect(Collectors.toMap(
+                    ValidationError::getField,
+                    ValidationError::getMessage
+                ));
+            
+            var errorResponse = ValidationErrorResponse.builder()
+                .message("Validation failed")
+                .code("VALIDATION_ERROR")
+                .errors(validationErrors)
+                .timestamp(Instant.now())
+                .build();
+                
+            return ResponseEntity.badRequest().body(errorResponse);
+        }
+        
+        // 4. Map to Application Core object
+        var createCommand = mapper.toCreateCommand(customerRep);
+        
+        // 5. Invoke Application Core service
+        var result = customerService.createCustomer(createCommand);
+        
+        // 7. Process successful response
+        if (result.isSuccess()) {
+            var customer = result.getValue();
+            var responseRep = mapper.toRepresentation(customer);
+            return ResponseEntity.status(HttpStatus.CREATED).body(responseRep);
+        }
+        
+        // 8. Process business logic failures
+        HttpStatus status = switch (result.getErrorCode()) {
+            case "DUPLICATE_EMAIL" -> HttpStatus.CONFLICT;
+            default -> HttpStatus.UNPROCESSABLE_ENTITY;
+        };
+        
+        var errorResponse = createErrorResponse(result.getErrorMessage(), result.getErrorCode());
+        return ResponseEntity.status(status).body(errorResponse);
+    }
+    
+    private ErrorResponse createErrorResponse(String message, String code) {
+        return ErrorResponse.builder()
+            .message(message)
+            .code(code)
+            .timestamp(Instant.now())
+            .build();
+    }
+}
+```
+
+```csharp C#
+// Result pattern for handling expected failures
+public class Result<T> {
+    public bool IsSuccess { get; }
+    public T Value { get; }
+    public string ErrorMessage { get; }
+    public string ErrorCode { get; }
+    
+    private Result(bool isSuccess, T value, string errorMessage, string errorCode) {
+        IsSuccess = isSuccess;
+        Value = value;
+        ErrorMessage = errorMessage;
+        ErrorCode = errorCode;
+    }
+    
+    public static Result<T> Success(T value) => 
+        new(true, value, null, null);
+    
+    public static Result<T> Failure(string errorMessage, string errorCode) => 
+        new(false, default(T), errorMessage, errorCode);
+}
+
+// Service implementation - no validation, pure business logic
+public class CustomerService {
+    
+    public async Task<Result<Customer>> CreateCustomerAsync(CreateCustomerCommand command) {
+        // Business logic only - validation handled in controller
+        if (await EmailAlreadyExistsAsync(command.Email)) {
+            return Result<Customer>.Failure("Email already exists", "DUPLICATE_EMAIL");
+        }
+        
+        // Successful creation
+        var customer = new Customer(command.Email, command.Name);
+        await _customerRepository.SaveAsync(customer);
+        
+        return Result<Customer>.Success(customer);
+    }
+    
+    public async Task<Result<Customer>> GetCustomerAsync(GetCustomerQuery query) {
+        var customer = await _customerRepository.FindByIdAsync(query.CustomerId);
+        if (customer == null) {
+            // This is expected behavior, not an exception
+            return Result<Customer>.Failure("Customer not found", "CUSTOMER_NOT_FOUND");
+        }
+        
+        return Result<Customer>.Success(customer);
+    }
+}
+
+// Controller following input port flow pattern
+[ApiController]
+[Route("api/[controller]")]
+public class CustomersController : ControllerBase {
+    
+    private readonly IAuthenticationService _authService;
+    private readonly IValidationService _validationService;
+    private readonly ICustomerService _customerService;
+    private readonly ICustomerMapper _mapper;
+    
+    [HttpPost]
+    public async Task<IActionResult> CreateCustomer([FromBody] CustomerRepresentation customerRep) {
+        
+        // 1. Authentication & Authorization
+        var authResult = await _authService.AuthenticateAsync(HttpContext);
+        if (!authResult.IsAuthenticated) {
+            return Unauthorized(new ErrorResponse("Authentication required", "UNAUTHENTICATED"));
+        }
+        
+        if (!await _authService.IsAuthorizedAsync(authResult.User, "customers:create")) {
+            return Forbid(new ErrorResponse("Insufficient permissions", "FORBIDDEN"));
+        }
+        
+        // 3. Call Validation Service
+        var validationResult = await _validationService.ValidateAsync(customerRep);
+        if (!validationResult.IsValid) {
+            // Handle multiple validation errors
+            var validationErrors = validationResult.Errors
+                .ToDictionary(e => e.Field, e => e.Message);
+            
+            var errorResponse = new ValidationErrorResponse {
+                Message = "Validation failed",
+                Code = "VALIDATION_ERROR",
+                Errors = validationErrors,
+                Timestamp = DateTime.UtcNow
+            };
+            
+            return BadRequest(errorResponse);
+        }
+        
+        // 4. Map to Application Core object
+        var createCommand = _mapper.ToCreateCommand(customerRep);
+        
+        // 5. Invoke Application Core service
+        var result = await _customerService.CreateCustomerAsync(createCommand);
+        
+        // 7. Process successful response
+        if (result.IsSuccess) {
+            var customer = result.Value;
+            var responseRep = _mapper.ToRepresentation(customer);
+            return CreatedAtAction(nameof(GetCustomer), new { id = customer.Id }, responseRep);
+        }
+        
+        // 8. Process business logic failures
+        var status = result.ErrorCode switch {
+            "DUPLICATE_EMAIL" => HttpStatusCode.Conflict,
+            _ => HttpStatusCode.UnprocessableEntity
+        };
+        
+        var businessErrorResponse = new ErrorResponse(result.ErrorMessage, result.ErrorCode, DateTime.UtcNow);
+        return StatusCode((int)status, businessErrorResponse);
+    }
+}
+```
+
+```javascript JavaScript
+// Result pattern for handling expected failures
+class Result {
+    constructor(isSuccess, value, errorMessage, errorCode) {
+        this.isSuccess = isSuccess;
+        this.value = value;
+        this.errorMessage = errorMessage;
+        this.errorCode = errorCode;
+    }
+    
+    static success(value) {
+        return new Result(true, value, null, null);
+    }
+    
+    static failure(errorMessage, errorCode) {
+        return new Result(false, null, errorMessage, errorCode);
+    }
+}
+
+// Service implementation - no validation, pure business logic
+class CustomerService {
+    
+    async createCustomer(command) {
+        // Business logic only - validation handled in controller
+        if (await this.emailAlreadyExists(command.email)) {
+            return Result.failure('Email already exists', 'DUPLICATE_EMAIL');
+        }
+        
+        // Successful creation
+        const customer = new Customer(command.email, command.name);
+        await this.customerRepository.save(customer);
+        
+        return Result.success(customer);
+    }
+    
+    async getCustomer(query) {
+        const customer = await this.customerRepository.findById(query.customerId);
+        if (!customer) {
+            // This is expected behavior, not an exception
+            return Result.failure('Customer not found', 'CUSTOMER_NOT_FOUND');
+        }
+        
+        return Result.success(customer);
+    }
+}
+
+// Controller following input port flow pattern
+class CustomerController {
+    
+    constructor(authService, validationService, customerService, mapper) {
+        this.authService = authService;
+        this.validationService = validationService;
+        this.customerService = customerService;
+        this.mapper = mapper;
+    }
+    
+    async createCustomer(req, res) {
+        try {
+            // 1. Authentication & Authorization
+            const authResult = await this.authService.authenticate(req);
+            if (!authResult.isAuthenticated) {
+                return res.status(401).json({
+                    message: 'Authentication required',
+                    code: 'UNAUTHENTICATED',
+                    timestamp: new Date().toISOString()
+                });
+            }
+            
+            if (!await this.authService.isAuthorized(authResult.user, 'customers:create')) {
+                return res.status(403).json({
+                    message: 'Insufficient permissions',
+                    code: 'FORBIDDEN',
+                    timestamp: new Date().toISOString()
+                });
+            }
+            
+            // 3. Call Validation Service
+            const validationResult = await this.validationService.validate(req.body);
+            if (!validationResult.isValid) {
+                // Handle multiple validation errors
+                const validationErrors = validationResult.errors.reduce((acc, error) => {
+                    acc[error.field] = error.message;
+                    return acc;
+                }, {});
+                
+                return res.status(400).json({
+                    message: 'Validation failed',
+                    code: 'VALIDATION_ERROR',
+                    errors: validationErrors,
+                    timestamp: new Date().toISOString()
+                });
+            }
+            
+            // 4. Map to Application Core object
+            const createCommand = this.mapper.toCreateCommand(req.body);
+            
+            // 5. Invoke Application Core service
+            const result = await this.customerService.createCustomer(createCommand);
+            
+            // 7. Process successful response
+            if (result.isSuccess) {
+                const customer = result.value;
+                const responseRep = this.mapper.toRepresentation(customer);
+                return res.status(201).json(responseRep);
+            }
+            
+            // 8. Process business logic failures
+            const status = result.errorCode === 'DUPLICATE_EMAIL' ? 409 : 422;
+            
+            return res.status(status).json({
+                message: result.errorMessage,
+                code: result.errorCode,
+                timestamp: new Date().toISOString()
+            });
+            
+        } catch (error) {
+            // 6. Let unhandled exceptions bubble up to global handler
+            throw error;
+        }
+    }
+}
+```
+
+```typescript TypeScript
+// Result pattern for handling expected failures
+export class Result<T> {
+    private constructor(
+        public readonly isSuccess: boolean,
+        public readonly value: T | null,
+        public readonly errorMessage: string | null,
+        public readonly errorCode: string | null
+    ) {}
+    
+    static success<T>(value: T): Result<T> {
+        return new Result(true, value, null, null);
+    }
+    
+    static failure<T>(errorMessage: string, errorCode: string): Result<T> {
+        return new Result<T>(false, null, errorMessage, errorCode);
+    }
+}
+
+// Service implementation - no validation, pure business logic
+@Injectable()
+export class CustomerService {
+    
+    async createCustomer(command: CreateCustomerCommand): Promise<Result<Customer>> {
+        // Business logic only - validation handled in controller
+        if (await this.emailAlreadyExists(command.email)) {
+            return Result.failure<Customer>('Email already exists', 'DUPLICATE_EMAIL');
+        }
+        
+        // Successful creation
+        const customer = new Customer(command.email, command.name);
+        await this.customerRepository.save(customer);
+        
+        return Result.success(customer);
+    }
+    
+    async getCustomer(query: GetCustomerQuery): Promise<Result<Customer>> {
+        const customer = await this.customerRepository.findById(query.customerId);
+        if (!customer) {
+            // This is expected behavior, not an exception
+            return Result.failure<Customer>('Customer not found', 'CUSTOMER_NOT_FOUND');
+        }
+        
+        return Result.success(customer);
+    }
+}
+
+// Controller following input port flow pattern
+@Controller('customers')
+export class CustomersController {
+    
+    constructor(
+        private readonly authService: IAuthenticationService,
+        private readonly validationService: IValidationService,
+        private readonly customerService: ICustomerService,
+        private readonly mapper: ICustomerMapper
+    ) {}
+    
+    @Post()
+    async createCustomer(
+        @Body() customerRep: CustomerRepresentation,
+        @Req() req: Request
+    ): Promise<any> {
+        
+        // 1. Authentication & Authorization
+        const authResult = await this.authService.authenticate(req);
+        if (!authResult.isAuthenticated) {
+            throw new UnauthorizedException({
+                message: 'Authentication required',
+                code: 'UNAUTHENTICATED'
+            });
+        }
+        
+        if (!await this.authService.isAuthorized(authResult.user, 'customers:create')) {
+            throw new ForbiddenException({
+                message: 'Insufficient permissions',
+                code: 'FORBIDDEN'
+            });
+        }
+        
+        // 3. Call Validation Service
+        const validationResult = await this.validationService.validate(customerRep);
+        if (!validationResult.isValid) {
+            // Handle multiple validation errors
+            const validationErrors = validationResult.errors.reduce((acc, error) => {
+                acc[error.field] = error.message;
+                return acc;
+            }, {} as Record<string, string>);
+            
+            throw new BadRequestException({
+                message: 'Validation failed',
+                code: 'VALIDATION_ERROR',
+                errors: validationErrors,
+                timestamp: new Date().toISOString()
+            });
+        }
+        
+        // 4. Map to Application Core object
+        const createCommand = this.mapper.toCreateCommand(customerRep);
+        
+        // 5. Invoke Application Core service
+        const result = await this.customerService.createCustomer(createCommand);
+        
+        // 7. Process successful response
+        if (result.isSuccess) {
+            const customer = result.value!;
+            const responseRep = this.mapper.toRepresentation(customer);
+            return {
+                statusCode: 201,
+                data: responseRep
+            };
+        }
+        
+        // 8. Process business logic failures
+        const statusCode = result.errorCode === 'DUPLICATE_EMAIL' 
+            ? HttpStatus.CONFLICT 
+            : HttpStatus.UNPROCESSABLE_ENTITY;
+        
+        throw new HttpException({
+            message: result.errorMessage,
+            code: result.errorCode,
+            timestamp: new Date().toISOString()
+        }, statusCode);
+    }
+}
+```
+</CodeGroup>
+
+## **Method-Level Exception Handling**
+
+**Only catch exceptions when you can do something meaningful beyond what the global handler would do.** Most exceptions should bubble up to the global handler.
+
+<CodeGroup>
+```java Java
+// DO: Catch when you can meaningfully transform infrastructure failures to business results
+public Result<PaymentResult> processPayment(PaymentRequest request) {
+    try {
+        // Call to external payment service that may be unavailable
+        PaymentResponse response = paymentGateway.processPayment(request);
+        return Result.success(new PaymentResult(response.getTransactionId(), "APPROVED"));
+        
+    } catch (PaymentGatewayUnavailableException ex) {
+        // Meaningful handling: we can provide alternative behavior
+        // Include exception details for debugging while converting to business result
+        log.warn("Payment gateway unavailable, queuing for retry: {}", ex.getMessage());
+        queuePaymentForRetry(request);
+        return Result.failure(
+            "Payment gateway temporarily unavailable. Request queued for processing.", 
+            "PAYMENT_GATEWAY_UNAVAILABLE",
+            ex.getMessage()  // Include original exception message
+        );
+        
+    } catch (InsufficientFundsException ex) {
+        // Meaningful handling: this is expected business scenario
+        return Result.failure("Insufficient funds available", "INSUFFICIENT_FUNDS", ex.getMessage());
+    }
+    // All other exceptions (network issues, serialization errors, etc.) bubble up
+    // because global handler can deal with them appropriately
+}
+
+// DON'T: Catch exceptions that don't need special handling
+public Customer getBadExample(String customerId) {
+    try {
+        return externalServiceClient.getCustomer(customerId);
+    } catch (CustomerNotFoundException ex) {
+        // ANTI-PATTERN: "Not found" is routine - handle with Result pattern instead
+        log.error("Customer not found: " + ex.getMessage());
+        throw ex; // Don't do this!
+    } catch (Exception ex) {
+        // ANTI-PATTERN: Adds no value, hurts performance, loses context  
+        log.error("Error getting customer: " + ex.getMessage());
+        throw ex; // Don't do this!
+    }
+}
+
+// DO: Use try-with-resources for resource management, catch only infrastructure exceptions
+public Result<DocumentContent> processDocument(String filePath) {
+    try (BufferedReader reader = Files.newBufferedReader(Paths.get(filePath))) {
+        String content = reader.lines().collect(Collectors.joining("\n"));
+        DocumentContent document = parseDocument(content);
+        return Result.success(document);
+        
+    } catch (AccessDeniedException ex) {
+        // Meaningful handling: security issue that we can provide specific guidance for
+        return Result.failure("Access denied to document", "ACCESS_DENIED", ex.getMessage());
+        
+    } catch (NoSuchFileException ex) {
+        // Meaningful handling: missing file is expected scenario we can handle
+        return Result.failure("Document not found", "DOCUMENT_NOT_FOUND", ex.getMessage());
+        
+    } catch (IOException ex) {
+        // Infrastructure exception that's worth catching because we can provide context
+        return Result.failure("Failed to read document", "DOCUMENT_READ_ERROR", ex.getMessage());
+    }
+    // Parsing exceptions, security exceptions, etc. bubble up to global handler
+}
+```
+
+```csharp C#
+// DO: Catch when you can meaningfully transform infrastructure failures to business results
+public async Task<Result<PaymentResult>> ProcessPaymentAsync(PaymentRequest request) {
+    try {
+        // Call to external payment service that may be unavailable
+        var response = await _paymentGateway.ProcessPaymentAsync(request);
+        return Result<PaymentResult>.Success(new PaymentResult(response.TransactionId, "APPROVED"));
+        
+    } catch (PaymentGatewayUnavailableException ex) {
+        // Meaningful handling: we can provide alternative behavior
+        // Include exception details for debugging while converting to business result
+        _logger.LogWarning("Payment gateway unavailable, queuing for retry: {Message}", ex.Message);
+        await QueuePaymentForRetryAsync(request);
+        return Result<PaymentResult>.Failure(
+            "Payment gateway temporarily unavailable. Request queued for processing.", 
+            "PAYMENT_GATEWAY_UNAVAILABLE",
+            ex.Message  // Include original exception message
+        );
+        
+    } catch (InsufficientFundsException ex) {
+        // Meaningful handling: this is expected business scenario
+        return Result<PaymentResult>.Failure("Insufficient funds available", "INSUFFICIENT_FUNDS", ex.Message);
+    }
+    // All other exceptions (network issues, serialization errors, etc.) bubble up
+    // because global handler can deal with them appropriately
+}
+
+// DON'T: Catch exceptions that don't need special handling
+public async Task<Customer> GetBadExampleAsync(string customerId) {
+    try {
+        return await _externalServiceClient.GetCustomerAsync(customerId);
+    } catch (CustomerNotFoundException ex) {
+        // ANTI-PATTERN: "Not found" is routine - handle with Result pattern instead
+        _logger.LogError(ex, "Customer not found: {Message}", ex.Message);
+        throw; // Don't do this!
+    } catch (Exception ex) {
+        // ANTI-PATTERN: Adds no value, hurts performance, loses context
+        _logger.LogError(ex, "Error getting customer: {Message}", ex.Message);
+        throw; // Don't do this!
+    }
+}
+
+// DO: Use using statements for resource management, catch only infrastructure exceptions
+public async Task<Result<DocumentContent>> ProcessDocumentAsync(string filePath) {
+    try {
+        using var reader = new StreamReader(filePath);
+        var content = await reader.ReadToEndAsync();
+        var document = ParseDocument(content);
+        return Result<DocumentContent>.Success(document);
+        
+    } catch (UnauthorizedAccessException ex) {
+        // Meaningful handling: security issue that we can provide specific guidance for
+        return Result<DocumentContent>.Failure("Access denied to document", "ACCESS_DENIED", ex.Message);
+        
+    } catch (FileNotFoundException ex) {
+        // Meaningful handling: missing file is expected scenario we can handle
+        return Result<DocumentContent>.Failure("Document not found", "DOCUMENT_NOT_FOUND", ex.Message);
+        
+    } catch (IOException ex) {
+        // Infrastructure exception that's worth catching because we can provide context
+        return Result<DocumentContent>.Failure("Failed to read document", "DOCUMENT_READ_ERROR", ex.Message);
+    }
+    // Parsing exceptions, security exceptions, etc. bubble up to global handler
+}
+```
+
+```javascript JavaScript
+// DO: Catch when you can meaningfully transform infrastructure failures to business results
+async processPayment(request) {
+    try {
+        // Call to external payment service that may be unavailable
+        const response = await this.paymentGateway.processPayment(request);
+        return Result.success({ transactionId: response.transactionId, status: 'APPROVED' });
+        
+    } catch (error) {
+        // Handle specific error types that we can meaningfully respond to
+        if (error.code === 'PAYMENT_GATEWAY_UNAVAILABLE') {
+            // Meaningful handling: we can provide alternative behavior
+            // Include exception details for debugging while converting to business result
+            this.logger.warn('Payment gateway unavailable, queuing for retry:', error.message);
+            await this.queuePaymentForRetry(request);
+            return Result.failure(
+                'Payment gateway temporarily unavailable. Request queued for processing.', 
+                'PAYMENT_GATEWAY_UNAVAILABLE',
+                error.message  // Include original exception message
+            );
+        }
+        
+        if (error.code === 'INSUFFICIENT_FUNDS') {
+            // Meaningful handling: this is expected business scenario
+            return Result.failure('Insufficient funds available', 'INSUFFICIENT_FUNDS', error.message);
+        }
+        
+        // All other exceptions (network issues, parsing errors, etc.) bubble up
+        // because global handler can deal with them appropriately
+        throw error;
+    }
+}
+
+// DON'T: Catch exceptions that don't need special handling
+async getBadExample(customerId) {
+    try {
+        return await this.externalServiceClient.getCustomer(customerId);
+    } catch (error) {
+        if (error.code === 'NOT_FOUND') {
+            // ANTI-PATTERN: "Not found" is routine - handle with Result pattern instead
+            console.error('Customer not found:', error.message);
+            throw error; // Don't do this!
+        }
+        
+        // ANTI-PATTERN: Adds no value, hurts performance, loses context
+        console.error('Error getting customer:', error.message);
+        throw error; // Don't do this!
+    }
+}
+
+// DO: Handle file operations with proper error conversion, catch only infrastructure exceptions
+async processDocument(filePath) {
+    try {
+        const fs = require('fs').promises;
+        const content = await fs.readFile(filePath, 'utf8');
+        const document = this.parseDocument(content);
+        return Result.success(document);
+        
+    } catch (error) {
+        if (error.code === 'ENOENT') {
+            // Meaningful handling: missing file is expected scenario we can handle
+            return Result.failure('Document not found', 'DOCUMENT_NOT_FOUND', error.message);
+        }
+        
+        if (error.code === 'EACCES') {
+            // Meaningful handling: security issue that we can provide specific guidance for
+            return Result.failure('Access denied to document', 'ACCESS_DENIED', error.message);
+        }
+        
+        if (error.code && error.code.startsWith('E')) {
+            // Infrastructure exception that's worth catching because we can provide context
+            return Result.failure('Failed to read document', 'DOCUMENT_READ_ERROR', error.message);
+        }
+        
+        // Parsing exceptions, business logic exceptions, etc. bubble up to global handler
+        throw error;
+    }
+}
+```
+
+```typescript TypeScript
+// DO: Catch when you can meaningfully transform infrastructure failures to business results
+async processPayment(request: PaymentRequest): Promise<Result<PaymentResult>> {
+    try {
+        // Call to external payment service that may be unavailable
+        const response = await this.paymentGateway.processPayment(request);
+        return Result.success({ transactionId: response.transactionId, status: 'APPROVED' });
+        
+    } catch (error) {
+        // Handle specific error types with type guards that we can meaningfully respond to
+        if (error instanceof PaymentGatewayUnavailableError) {
+            // Meaningful handling: we can provide alternative behavior
+            // Include exception details for debugging while converting to business result
+            this.logger.warn('Payment gateway unavailable, queuing for retry:', error.message);
+            await this.queuePaymentForRetry(request);
+            return Result.failure<PaymentResult>(
+                'Payment gateway temporarily unavailable. Request queued for processing.', 
+                'PAYMENT_GATEWAY_UNAVAILABLE',
+                error.message  // Include original exception message
+            );
+        }
+        
+        if (error instanceof InsufficientFundsError) {
+            // Meaningful handling: this is expected business scenario
+            return Result.failure<PaymentResult>('Insufficient funds available', 'INSUFFICIENT_FUNDS', error.message);
+        }
+        
+        // All other exceptions (network issues, parsing errors, etc.) bubble up
+        // because global handler can deal with them appropriately
+        throw error;
+    }
+}
+
+// DON'T: Catch exceptions that don't need special handling
+async getBadExample(customerId: string): Promise<Customer> {
+    try {
+        return await this.externalServiceClient.getCustomer(customerId);
+    } catch (error) {
+        if (error instanceof CustomerNotFoundError) {
+            // ANTI-PATTERN: "Not found" is routine - handle with Result pattern instead
+            this.logger.error('Customer not found:', error.message);
+            throw error; // Don't do this!
+        }
+        
+        // ANTI-PATTERN: Adds no value, hurts performance, loses context  
+        this.logger.error('Error getting customer:', error.message);
+        throw error; // Don't do this!
+    }
+}
+
+// DO: Handle file operations with proper error conversion, catch only infrastructure exceptions
+async processDocument(filePath: string): Promise<Result<DocumentContent>> {
+    try {
+        const fs = await import('fs/promises');
+        const content = await fs.readFile(filePath, 'utf8');
+        const document = this.parseDocument(content);
+        return Result.success(document);
+        
+    } catch (error) {
+        if (error instanceof Error) {
+            const fsError = error as NodeJS.ErrnoException;
+            
+            if (fsError.code === 'ENOENT') {
+                // Meaningful handling: missing file is expected scenario we can handle
+                return Result.failure<DocumentContent>('Document not found', 'DOCUMENT_NOT_FOUND', fsError.message);
+            }
+            
+            if (fsError.code === 'EACCES') {
+                // Meaningful handling: security issue that we can provide specific guidance for
+                return Result.failure<DocumentContent>('Access denied to document', 'ACCESS_DENIED', fsError.message);
+            }
+            
+            if (fsError.code && fsError.code.startsWith('E')) {
+                // Infrastructure exception that's worth catching because we can provide context
+                return Result.failure<DocumentContent>('Failed to read document', 'DOCUMENT_READ_ERROR', fsError.message);
+            }
+        }
+        
+        // Parsing exceptions, business logic exceptions, etc. bubble up to global handler
+        throw error;
+    }
+}
+```
+</CodeGroup>
+
+# Anti-Patterns to Avoid
+
+## **❌ Meaningless Custom Exceptions**
+
+<CodeGroup>
+```java Java
+// DON'T: Custom exception that adds no value
+public class CustomerBusinessException extends RuntimeException {
+    public CustomerBusinessException(String message) {
+        super(message);
+    }
+}
+
+// This adds no context beyond a standard RuntimeException
+throw new CustomerBusinessException("Something went wrong");
+```
+
+```csharp C#
+// DON'T: Custom exception that adds no value
+public class CustomerBusinessException : Exception {
+    public CustomerBusinessException(string message) : base(message) { }
+}
+
+// This adds no context beyond a standard Exception
+throw new CustomerBusinessException("Something went wrong");
+```
+
+```javascript JavaScript
+// DON'T: Custom exception that adds no value
+class CustomerBusinessException extends Error {
+    constructor(message) {
+        super(message);
+        this.name = 'CustomerBusinessException';
+    }
+}
+
+// This adds no context beyond a standard Error
+throw new CustomerBusinessException('Something went wrong');
+```
+
+```typescript TypeScript
+// DON'T: Custom exception that adds no value
+class CustomerBusinessException extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = 'CustomerBusinessException';
+    }
+}
+
+// This adds no context beyond a standard Error
+throw new CustomerBusinessException('Something went wrong');
+```
+</CodeGroup>
+
+## **❌ Catch-Log-Rethrow Pattern**
+
+<CodeGroup>
+```java Java
+// DON'T: This is an anti-pattern
+public Customer processCustomer(String customerId) {
+    try {
+        return customerService.getCustomer(customerId);
+    } catch (Exception ex) {
+        // Performance hit: unnecessary stack unwinding
+        // Information loss: stack trace pollution  
+        // Code complexity: adds no business value
+        log.error("Error processing customer: " + ex.getMessage(), ex);
+        throw ex; // Don't do this!
+    }
+}
+```
+
+```csharp C#
+// DON'T: This is an anti-pattern
+public async Task<Customer> ProcessCustomerAsync(string customerId) {
+    try {
+        return await _customerService.GetCustomerAsync(customerId);
+    } catch (Exception ex) {
+        // Performance hit: unnecessary stack unwinding
+        // Information loss: stack trace pollution
+        // Code complexity: adds no business value
+        _logger.LogError(ex, "Error processing customer: {Message}", ex.Message);
+        throw; // Don't do this!
+    }
+}
+```
+
+```javascript JavaScript
+// DON'T: This is an anti-pattern
+async processCustomer(customerId) {
+    try {
+        return await this.customerService.getCustomer(customerId);
+    } catch (error) {
+        // Performance hit: unnecessary processing
+        // Information loss: context pollution
+        // Code complexity: adds no business value
+        console.error('Error processing customer:', error.message);
+        throw error; // Don't do this!
+    }
+}
+```
+
+```typescript TypeScript
+// DON'T: This is an anti-pattern
+async processCustomer(customerId: string): Promise<Customer> {
+    try {
+        return await this.customerService.getCustomer(customerId);
+    } catch (error) {
+        // Performance hit: unnecessary processing
+        // Information loss: context pollution  
+        // Code complexity: adds no business value
+        this.logger.error('Error processing customer:', error.message);
+        throw error; // Don't do this!
+    }
+}
+```
+</CodeGroup>
+
+## **❌ Using Exceptions for Control Flow**
+
+<CodeGroup>
+```java Java
+// DON'T: Use exceptions for expected business logic
+public void validateCustomer(Customer customer) {
+    if (customer.getEmail() == null) {
+        throw new IllegalArgumentException("Email is required"); // Don't do this!
+    }
+    
+    if (!isValidEmail(customer.getEmail())) {
+        throw new IllegalArgumentException("Invalid email format"); // Don't do this!
+    }
+}
+
+// DO: Use Result pattern instead
+public Result<Void> validateCustomer(Customer customer) {
+    if (customer.getEmail() == null) {
+        return Result.failure("Email is required", "MISSING_EMAIL");
+    }
+    
+    if (!isValidEmail(customer.getEmail())) {
+        return Result.failure("Invalid email format", "INVALID_EMAIL_FORMAT");
+    }
+    
+    return Result.success(null);
+}
+```
+
+```csharp C#
+// DON'T: Use exceptions for expected business logic
+public void ValidateCustomer(Customer customer) {
+    if (customer.Email == null) {
+        throw new ArgumentException("Email is required"); // Don't do this!
+    }
+    
+    if (!IsValidEmail(customer.Email)) {
+        throw new ArgumentException("Invalid email format"); // Don't do this!
+    }
+}
+
+// DO: Use Result pattern instead
+public Result<object> ValidateCustomer(Customer customer) {
+    if (customer.Email == null) {
+        return Result<object>.Failure("Email is required", "MISSING_EMAIL");
+    }
+    
+    if (!IsValidEmail(customer.Email)) {
+        return Result<object>.Failure("Invalid email format", "INVALID_EMAIL_FORMAT");
+    }
+    
+    return Result<object>.Success(null);
+}
+```
+
+```javascript JavaScript
+// DON'T: Use exceptions for expected business logic
+validateCustomer(customer) {
+    if (!customer.email) {
+        throw new Error('Email is required'); // Don't do this!
+    }
+    
+    if (!this.isValidEmail(customer.email)) {
+        throw new Error('Invalid email format'); // Don't do this!
+    }
+}
+
+// DO: Use Result pattern instead
+validateCustomer(customer) {
+    if (!customer.email) {
+        return Result.failure('Email is required', 'MISSING_EMAIL');
+    }
+    
+    if (!this.isValidEmail(customer.email)) {
+        return Result.failure('Invalid email format', 'INVALID_EMAIL_FORMAT');
+    }
+    
+    return Result.success(null);
+}
+```
+
+```typescript TypeScript
+// DON'T: Use exceptions for expected business logic
+validateCustomer(customer: Customer): void {
+    if (!customer.email) {
+        throw new Error('Email is required'); // Don't do this!
+    }
+    
+    if (!this.isValidEmail(customer.email)) {
+        throw new Error('Invalid email format'); // Don't do this!
+    }
+}
+
+// DO: Use Result pattern instead
+validateCustomer(customer: Customer): Result<void> {
+    if (!customer.email) {
+        return Result.failure<void>('Email is required', 'MISSING_EMAIL');
+    }
+    
+    if (!this.isValidEmail(customer.email)) {
+        return Result.failure<void>('Invalid email format', 'INVALID_EMAIL_FORMAT');
+    }
+    
+    return Result.success<void>(undefined);
+}
+```
+</CodeGroup>
+
+# Summary
+
+Effective exception handling in microservices requires:
+
+1. **Single Point of Handling**: Use global exception handlers exclusively
+2. **Result Patterns**: Handle expected failures without exceptions  
+3. **Selective Catching**: Only catch exceptions when you can meaningfully handle them
+4. **No Catch-Rethrow**: Avoid the performance and clarity costs of catch-log-rethrow
+5. **Meaningful Custom Exceptions**: Create custom exceptions only when they add genuine value
+
+This approach delivers better performance, clearer code, and more maintainable systems while providing excellent debugging capabilities through centralized logging and sanitized client responses.
+

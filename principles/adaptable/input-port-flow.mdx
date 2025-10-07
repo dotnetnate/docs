@@ -1,0 +1,64 @@
+---
+title: "Input Port Interaction Flow"
+description: "Generic interaction pattern for any input port type in a ports & adapters architecture."
+---
+
+
+Input port handlers are responsible for routing and basic input/output operations across any protocol (HTTP/REST, gRPC, MCP, SOAP, GraphQL, etc.). This is the universal pattern where the term **Application Core** refers to the layer of components that contain business logic, separated from the Inbound Port/Protocol layer.
+
+## Universal Flow Pattern
+
+1. **Authenticate and authorize** the request. Return the appropriate **port-specific error response** if either fails. Authorization checks may also take place within the **Application Core**, and appropriate exceptions must be thrown from the **Application Core** when such circumstances occur.
+
+2. **Receive inbound message** from the caller in the port's native format.
+
+3. **Call a Validation Service** to perform input validation.
+   - If validation fails, return a **port-specific validation error response** along with the validation error details. Examples:
+     - **HTTP/REST**: 400 status with error body
+     - **gRPC**: INVALID_ARGUMENT status with error details
+     - **MCP**: Error response with validation messages
+     - **SOAP**: Fault response with validation details
+
+4. **Map the inbound message** to an Application Core object via a mapper or type mapping service.
+
+5. **Invoke an Application Core service** with the mapped input object.
+   - The Application Core service orchestrates domain components to complete the use case/function and returns a result, which is also an Application Core object.
+
+6. **Handle unhandled exceptions**: If an unhandled exception occurs at any point during execution, the global exception handler will log the error in detail and return a **port-specific system error response** with a sanitized error message. Examples:
+   - **HTTP/REST**: 500 status with sanitized message
+   - **gRPC**: INTERNAL status with error details
+   - **MCP**: System error response
+   - **SOAP**: Fault response with system error
+
+7. **Process successful responses**:
+   - If the response from the **Application Core** indicates **success**:
+     - Map the Application Core response to the **outbound message format** for the protocol
+     - Return the appropriate **port-specific success response** along with the outbound message, if appropriate
+
+8. **Process business logic failures**:
+   - If the response from the Application Core indicates a **business logic failure**:
+     - Return the appropriate **port-specific business error response** along with relevant information mapped from the **Application Core** result. Examples:
+       - **HTTP/REST**: 422 (Unprocessable Entity), 409 (Conflict), etc.
+       - **gRPC**: FAILED_PRECONDITION, ALREADY_EXISTS, etc.
+       - **MCP**: Business error response with context
+       - **SOAP**: Business fault response
+
+## Key Principles
+
+- **Protocol Independence**: The core flow remains identical regardless of the input port protocol
+- **Port-Specific Responses**: Each protocol handles success/error responses in its native format
+- **Consistent Error Handling**: All ports follow the same exception handling pattern
+- **Thin Port Handlers**: Port handlers contain minimal logic and delegate to the Application Core
+- **Clear Separation**: Maintain distinct boundaries between protocol concerns and business logic
+
+## Protocol-Specific Adaptations
+
+While the flow is universal, each port type implements responses in its native format:
+
+- **HTTP/REST**: Status codes, JSON payloads, headers
+- **gRPC**: Status codes, protobuf messages, metadata
+- **MCP (Model Context Protocol)**: Structured responses, tool results, errors
+- **SOAP**: SOAP envelopes, fault responses, WSDL compliance
+- **GraphQL**: Data/errors structure, field-level error handling
+- **Message Queue Consumers**: Acknowledgments, dead letter handling
+- **WebSocket**: Message framing, connection state management
